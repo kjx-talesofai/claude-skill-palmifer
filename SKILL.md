@@ -88,6 +88,7 @@ returning compact JSON is ≈ 50–300.
 
 ## Notes
 
+- Every request carries the token the daemon writes to `~/.cache/palmifer/token` (0600) on first run; non-loopback hosts and untokened requests are rejected.
 - Daemon on `127.0.0.1:8798` (override `PALMIFER_DAEMON_PORT`); state and logs
   in `~/.cache/palmifer/`. A command error never kills the daemon.
 - Proxy environment variables are stripped at startup: the tool only talks to
