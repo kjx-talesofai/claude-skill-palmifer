@@ -298,8 +298,8 @@ try {
   check("dom rows carry attributes (id/data-testid/aria-label)", !!firstRow?.attrs && (firstRow.attrs.id === "lbl" || firstRow.attrs["data-testid"]), JSON.stringify(firstRow));
 
   const starved = palmiferWithEnv({ PALMIFER_CMD_BUDGET_MS: "700" }, "wait", "--js", "false", "--timeout", "8000");
-  check("a command that runs past its budget says which command and what to check",
-    starved.code !== 0 && /out of its \d+s budget/.test(starved.text) && /palmifer wait/.test(starved.text) && /--front/.test(starved.text),
+  check("a command that runs past its budget says which command, which budget, and what to check",
+    starved.code !== 0 && /out of its 700ms budget/.test(starved.text) && /palmifer wait/.test(starved.text) && /--front/.test(starved.text),
     starved.text.slice(0, 200));
 
   // cancel: start a long wait, then stop it from another process

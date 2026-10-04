@@ -600,14 +600,14 @@ function commandBudgetLeft() {
   return Math.min(60000, left); // <= 0 means the command is out of time
 }
 function budgetError(method) {
-  const spent = commandDeadline ? (budgetFor(runningCommand || "") - Math.max(0, commandDeadline - Date.now())) : 0;
   return new Error(
-    `${method} gave up: \`palmifer ${runningCommand || "?"}\` ran out of its ${Math.max(0, Math.round(spent / 1000))}s budget.\n` +
+    `${method} gave up: \`palmifer ${runningCommand || "?"}\` ran out of its ${Math.round(commandBudgetMs)}ms budget.\n` +
       "  What to check: is the tab hidden (pass --front)? is the page busy or mid-navigation?\n" +
       "  A longer leash: --timeout for wait, PALMIFER_CMD_BUDGET_MS for everything.",
   );
 }
 let commandDeadline = null;
+let commandBudgetMs = 0; // the budget this command actually got
 
 /** Can we actually open a WebSocket to this endpoint right now? */
 async function canConnect(url, timeoutMs = 1500) {
@@ -2090,7 +2090,8 @@ async function runLocal(name, positional, localArgs, requestedBudget = 0) {
   if (!fn) throw new Error(`unknown command: ${name}`);
   runningCommand = name;
   cancelRequested = false; // a stale cancel must not kill the next command
-  commandDeadline = Date.now() + budgetFor(name, requestedBudget);
+  commandBudgetMs = budgetFor(name, requestedBudget);
+  commandDeadline = Date.now() + commandBudgetMs;
   try {
     return await fn(positional);
   } finally {
