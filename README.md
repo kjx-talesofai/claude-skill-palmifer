@@ -17,6 +17,8 @@ Let an AI agent drive **your** Chrome — the one you are already signed into �
 
 **为什么做**：以前我一直用 kimi-webbridge，它第一次让 agent 能"以你的身份"在真浏览器里干活。后来它长成了一个更完整的产品（自带账号和侧边栏）——对产品来说是好事，只是不再是我要的那座中立的桥。有点可惜，毕竟以前天天用。所以 palmifer 就是把这件事做小：**只做桥**。
 
+**和 [browser-use](https://github.com/browser-use/browser-use) 的分工**：它不是同一类东西 —— 它是一个 agent 平台，默认自己起浏览器，还能让模型去规划、执行，或者走云端。palmifer 是故意做窄的：一座接进**已经开着、已经登录**的浏览器的桥。想要那个"会规划的 agent"，用 browser-use；想让某件具体的事在**你自己的**浏览器里以你的身份跑完，那就是它唯一做的事。
+
 **开启调试**（每个 Chrome 会话都要做一次）：
 
 1. 打开 `chrome://inspect/#remote-debugging`
@@ -76,6 +78,8 @@ agent ── bash ──▶ palmifer ── HTTP ──▶ daemon ── CDP ─
 I used kimi-webbridge for a long time and liked it: it was the first bridge that let an agent act as *you*, inside the browser where your sessions actually live. It has since grown into a bigger product with its own account and side panel. That is a fine direction for a product. It just left the bridge no longer the neutral plumbing I needed it to be — a bit sad, since it had become part of the daily routine.
 
 So palmifer is the small version of that idea: **a bridge that only bridges.** Your browser, your logins, nothing in between.
+
+Worth saying plainly, because it comes up: [browser-use](https://github.com/browser-use/browser-use) is a different kind of tool. It is an agent platform — it starts its own browser by default, and it can plan and carry out a task with a model, or in the cloud. palmifer is deliberately narrower: a bridge into the browser that is already open, with the logins already in it. If you want the agent, use browser-use. If you want a specific thing done in *your* browser, as you, that is the only thing this does.
 
 ## How it works
 
