@@ -16,7 +16,7 @@
  *   snapshot | text | click | fill | eval | wait | upload
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   close [tab] [--mine|--all] | stop
- *   bench [--runs N] [--command "status"] [--json]   measure real latency
+ *   bench [--runs N] [--full] [--writes-only] [--json]   measure real latency
  *
  * Global flags:
  *   --tab <n|id|substr>      target tab (default: current)

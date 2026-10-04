@@ -20,7 +20,7 @@
  * navigates a page it did not open.
  *
  * Usage
- *   palmifer bench [--runs N] [--warmup N] [--full] [--json] [--cold]
+ *   palmifer bench [--runs N] [--warmup N] [--full] [--writes-only] [--json] [--cold]
  *
  * `--cold` is opt-in: it restarts the daemon, Chrome treats that as a new client
  * and asks for approval again, and your click lands inside the measurement.

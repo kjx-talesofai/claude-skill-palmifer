@@ -165,6 +165,7 @@ It does not measure network time, page load, or any other tool.
 palmifer bench --full --runs 25     # publishable run
 palmifer bench --json > bench.json  # raw samples
 palmifer bench                      # quick look at the current tab
+palmifer bench --writes-only        # only the write paths (isolated)
 ```
 
 ## Notes
