@@ -44,6 +44,7 @@ let them enable it, and retry.
 | `close [tab] [--mine\|--all]` | close tabs |
 | `stop` | stop the local daemon |
 | `bench [--runs N] [--json] [--cold]` | measure real latency; read-only |
+| `mem` | daemon memory (heap after a forced GC) |
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
 `--port`, `--fast`. `--frame` applies to `snapshot`, `text`, `eval` and `wait`; the

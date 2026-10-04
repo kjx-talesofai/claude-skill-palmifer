@@ -161,6 +161,19 @@ spacing gap (≥1.2 s), per-character typing (45–140 ms) and an eased pointer 
 
 It does not measure network time, page load, or any other tool.
 
+**Stability.** 1200 mixed calls (300 of them `snapshot`, the heaviest read path) in 58 s: **0 failures**.
+With the daemon started under `--expose-gc`, `palmifer mem` reports memory after a forced collection:
+
+| calls | rss | heapUsed | heapTotal |
+|---|---|---|---|
+| 0 | 60.7 MB | 7.0 MB | 8.9 MB |
+| 400 | 75.1 MB | 8.4 MB | 17.4 MB |
+| 800 | 84.0 MB | 8.4 MB | 23.6 MB |
+| 1200 | 92.7 MB | 8.3 MB | 31.6 MB |
+
+RSS climbs because V8 keeps reserving heap (`heapTotal` grows); the data actually in use stays near 8 MB and
+stops growing. RSS is a high-water mark — check `mem` before calling something a leak.
+
 ```bash
 palmifer bench --full --runs 25     # publishable run
 palmifer bench --json > bench.json  # raw samples

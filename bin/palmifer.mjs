@@ -17,6 +17,7 @@
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   close [tab] [--mine|--all] | stop
  *   bench [--runs N] [--full] [--writes-only] [--json]   measure real latency
+ *   mem                                                    daemon memory (heap after GC)
  *
  * Global flags:
  *   --tab <n|id|substr>      target tab (default: current)
@@ -607,6 +608,20 @@ const commands = {
         url: t.url.slice(0, 100),
       })),
     );
+  },
+
+  async mem() {
+    // RSS is a high-water mark and says nothing about leaks; heapUsed after a
+    // forced collection does. The daemon needs --expose-gc for gcForced: true.
+    if (global.gc) global.gc();
+    const m = process.memoryUsage();
+    out({
+      rssMb: +(m.rss / 1048576).toFixed(1),
+      heapUsedMb: +(m.heapUsed / 1048576).toFixed(1),
+      heapTotalMb: +(m.heapTotal / 1048576).toFixed(1),
+      externalMb: +(m.external / 1048576).toFixed(1),
+      gcForced: !!global.gc,
+    });
   },
 
   async frames() {
