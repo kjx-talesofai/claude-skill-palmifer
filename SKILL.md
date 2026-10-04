@@ -31,12 +31,15 @@ let them enable it, and retry.
 |---|---|---|
 | the user's sessions | (default) | their real Chrome, their logins |
 | unattended / no window / no opt-in / CI | `browser` | palmifer starts its own Chrome in a fresh temp profile, headless; no login, nothing of theirs in it |
+| a logged-in browser that stays logged in | `browser --profile-dir <dir>` | same, but the profile is kept: log in once, survive restarts (`browser close` deletes only the temp ones) |
 | to test or scrape without touching their cookies | `anon on` | a cookie-less context inside the browser already in use (its own window) |
 
 `browser` needs no approval click; `browser --headed` shows the window,
-`browser close` stops it and deletes the profile, `browser use real|private`
-switches back and forth. `anon off` closes the anonymous tabs and returns to the
-normal profile. Say which one you used if the choice affects the user's account.
+`browser close` stops it (gracefully, so the profile is flushed) and deletes a
+temp profile, `browser use real|private` switches back and forth,
+`browser --dry-run` prints the exact Chrome command line without launching
+anything. `anon off` closes the anonymous tabs and returns to the normal
+profile. Say which one you used if the choice affects the user's account.
 
 ## Commands
 
@@ -56,16 +59,37 @@ normal profile. Say which one you used if the choice affects the user's account.
 | `network start\|list\|detail\|stop` | capture requests and bodies |
 | `cdp <Domain.method> ['{json}']` | raw CDP (`--browser` = browser level) |
 | `anon <on\|off\|status>` | cookie-less context, no logins |
-| `browser [url] [--headed]` / `browser status\|close\|use <real\|private>` | the throwaway browser |
+| `browser [url] [--headed] [--profile-dir <dir>] [--dry-run]` | the browser palmifer starts itself |
+| `browser status\|close\|use <real\|private>` | its lifecycle, and which one is active |
 | `close [tab] [--mine\|--all]` | close tabs |
 | `stop` | stop the local daemon |
 | `bench [--runs N] [--json] [--cold]` | measure real latency; read-only |
 | `mem` | daemon memory (heap after a forced GC) |
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
-`--port`, `--fast`, `--headed`, `--chrome <path>`. `--frame` applies to `snapshot`,
-`text`, `eval` and `wait`; the other commands act on the top document and say so
-if a frame is requested.
+`--port`, `--fast`, `--headed`, `--profile-dir`, `--dry-run`, `--chrome <path>`.
+`--frame` applies to `snapshot`, `text`, `eval` and `wait`; the other commands act
+on the top document and say so if a frame is requested.
+
+## On a headless server
+
+No display, nobody to click *Allow*: run palmifer's own browser and keep its
+profile, so a login survives restarts.
+
+```bash
+palmifer browser --profile-dir ~/.palmifer-profile https://example.com
+palmifer snapshot --actionable-only        # it is now the active browser
+palmifer browser close                     # stops it, keeps the profile
+```
+
+Needs Node >= 22 and a Chrome/Chromium (`PALMIFER_CHROME=/path/to/chrome` if it
+is not in the usual place). On Linux the launch flags adapt themselves: root and
+kernels without unprivileged user namespaces get `--no-sandbox`, and a `/dev/shm`
+under 512 MB gets `--disable-dev-shm-usage`. `PALMIFER_CHROME_FLAGS` adds
+anything else (`--lang=zh-CN --window-size=1280,900`; install CJK fonts or
+screenshots of Chinese pages come out as boxes). The daemon binds `127.0.0.1`
+only, so run the agent on the same machine. `palmifer browser --dry-run` shows
+the exact command line if a launch fails.
 
 ## Defaults
 

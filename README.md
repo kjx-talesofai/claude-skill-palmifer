@@ -42,9 +42,12 @@ palmifer status
 |---|---|---|---|---|
 | 默认 | 你的 Chrome | 要，每个 daemon 一次 | 有 | 你原来的窗口 |
 | `palmifer browser` | palmifer 自己起的临时 Chrome | 不要 | 没有 | 无头（`--headed` 可开窗） |
+| `palmifer browser --profile-dir <dir>` | 同上，但 profile 留着 | 不要 | 你在里面登的 | 无头 |
 | `palmifer anon on` | 当前浏览器里的匿名上下文 | 同上 | 没有 | 新开一个 |
 
-匿名隔离是**测过的、不是口头保证**：`node tests/private-mode.test.mjs` 会在普通上下文里种一个 cookie、确认它重开还在，再确认匿名上下文读不到它，最后确认关掉匿名后 cookie 依然在。
+**VPS / 服务器**：`palmifer browser --profile-dir ~/.palmifer-profile <url>` —— 无头、不用点 Allow、profile 持久（登一次就一直在）。Linux 上启动参数会自适应：root、或内核关了 unprivileged user namespace，自动加 `--no-sandbox`；`/dev/shm` 小于 512MB 自动加 `--disable-dev-shm-usage`；其它用 `PALMIFER_CHROME_FLAGS` 加（截图中文页记得装中文字体）。`browser close` 先发 `Browser.close` 优雅退出，cookie / localStorage 会刷盘，所以下次启动还在。daemon 只监听 `127.0.0.1`，agent 得跑在同一台机器上。**老实说**：这份只在 macOS 上端到端跑过，我没有 Linux 机器实测；Linux 专属那套启动参数是用单元测试在 macOS 上锁住的，`palmifer browser --dry-run` 会打印它实际要跑的命令行。
+
+匿名隔离和持久 profile 都是**测过的、不是口头保证**：`node tests/private-mode.test.mjs`（60 项）会种一个持久 cookie + 一个 localStorage，重启浏览器后确认还在；匿名上下文则确认读不到普通 profile 的 cookie。
 
 **注意事项**：
 
@@ -136,14 +139,14 @@ The daemon starts itself on the first command and listens on `127.0.0.1:8798`; s
 |---|---|---|---|---|
 | default | the one you are signed into | yes, once per daemon start | yes | the one you already have |
 | `palmifer browser` | palmifer's own Chrome, fresh temp profile | no | none | none (headless; `--headed` shows one) |
+| `palmifer browser --profile-dir <dir>` | the same, with a profile that is kept | no | whatever you log into there | none (headless) |
 | `palmifer anon on` | a cookie-less context in the current browser | as above | none | Chrome opens a new one |
 
 `palmifer browser` is the unattended path: nothing to approve, nothing of the
 user's on disk, and `palmifer browser close` kills the process and deletes the
-profile. That is what you want on a server, in CI, or when nobody is around to
-click *Allow*. `palmifer browser --headed` shows the window while keeping the
-throwaway profile. `palmifer browser use real` switches back without stopping
-it.
+profile. That is what you want in CI, or when nobody is around to click *Allow*.
+`palmifer browser --headed` shows the window while keeping the throwaway profile.
+`palmifer browser use real` switches back without stopping it.
 
 `palmifer anon on` keeps working in the browser that is already open — same
 Chrome, same binary — but every tab opened from then on gets its own empty
@@ -151,17 +154,60 @@ cookie jar, so a task can run without touching the user's sessions. On a site
 where they are logged in, the anonymous tab is logged out; `palmifer anon off`
 closes those tabs and the normal profile is exactly as it was.
 
+## On a server (VPS)
+
+A headless box with no display and nobody to click *Allow* is exactly what
+`browser` mode is for. Give it a profile to keep, and a login survives restarts:
+
+```bash
+palmifer browser --profile-dir ~/.palmifer-profile https://example.com
+palmifer snapshot --actionable-only     # it is the active browser now
+palmifer browser close                  # stops it, keeps the profile
+```
+
+- Needs Node >= 22 and a Chrome/Chromium. Not in the usual place? `PALMIFER_CHROME=/path/to/chrome`.
+- No approval click, ever: the opt-in prompt belongs to *your* browser, not to the one palmifer starts.
+- The launch flags adapt to Linux: running as root, or on a kernel with
+  unprivileged user namespaces switched off, gets `--no-sandbox`; a `/dev/shm`
+  under 512 MB gets `--disable-dev-shm-usage`. Add anything else with
+  `PALMIFER_CHROME_FLAGS="--lang=zh-CN --window-size=1280,900"`, and install CJK
+  fonts if you screenshot Chinese pages (otherwise you get boxes).
+- `palmifer browser close` is a graceful shutdown (`Browser.close` first), so the
+  profile is flushed. Cookies and `localStorage` from the session are on disk for
+  the next start.
+- The daemon binds `127.0.0.1` and only that, so run the agent on the same
+  machine.
+- If a launch fails, `palmifer browser --dry-run` prints the exact command line it
+  would have used, without launching anything.
+
+**Honest status:** the Linux flag logic above is covered by unit tests on every
+platform, but this repo has only been run end-to-end on macOS — I have not had a
+Linux machine to try it on. On a new VPS, two commands are enough to tell:
+
+```bash
+palmifer browser --dry-run     # what it intends to run
+palmifer browser && palmifer status   # does it actually come up
+```
+
 ## Tests
 
 ```bash
-node tests/private-mode.test.mjs      # 26 checks, needs Node >= 22 and Chrome
+node tests/private-mode.test.mjs      # 60 checks, needs Node >= 22 and Chrome
 ```
 
 It uses its own daemon port and its own state directory, so it never touches the
-palmifer you use day to day, and it only ever drives the throwaway browser — your
-own Chrome is not contacted. Anonymity is checked with a real cookie: set it in
-the normal context, confirm it survives reopening there, confirm the anonymous
-context cannot see it, then confirm turning anonymity off brings it back.
+palmifer you use day to day, and it only ever drives the browser palmifer starts —
+your own Chrome is not contacted. What it actually pins down:
+
+- anonymity, with a real cookie: set in the normal context, survives a reopen
+  there, invisible in the anonymous context, back after `anon off`;
+- `--profile-dir`: a cookie and a `localStorage` key survive a **full browser
+  restart**, and the profile is still there after `close` (a session cookie would
+  prove nothing, so the test sets a durable one);
+- launch flags for the combinations this machine cannot run: root and
+  small-`/dev/shm` on Linux, `macOS` never getting `--no-sandbox`;
+- `--dry-run` launching nothing and not switching the active browser;
+- the temp profile really is deleted, and the process really is gone, after `close`.
 
 ## Benchmark
 
@@ -232,7 +278,7 @@ palmifer bench --writes-only        # only the write paths (isolated)
 - Chrome approves **per connecting client**, so it is one *Allow* per daemon start: after `palmifer stop`, or after the daemon exits, the next command asks again. Commands never ask.
 - Loopback only: the daemon binds `127.0.0.1`, requires the token it writes on first run to `~/.cache/palmifer/token`, and rejects non-loopback hosts.
 - While the toggle is on, Chrome shows a "being controlled by automated test software" banner.
-- The throwaway browser's profile lives under the OS temp dir and is deleted by `palmifer browser close`; a profile left behind by a crash is cleaned up on the next start.
+- The throwaway browser's profile lives under the OS temp dir and is deleted by `palmifer browser close`; a profile left behind by a crash is cleaned up on the next start. A `--profile-dir` profile is never deleted — it is yours.
 - Anonymous contexts live only as long as Chrome does, and only inside the browser that was current when they were created. Chrome restarting, or a `browser`/`browser use` switch, simply means running `anon on` again.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
 

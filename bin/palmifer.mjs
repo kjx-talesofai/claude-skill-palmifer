@@ -26,6 +26,9 @@
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   anon <on|off|status>                 cookie-less context, no logins, no profile
  *   browser [url] [--headed]             start the throwaway browser (headless)
+ *   browser --profile-dir <dir> [url]    keep the profile: log in once, stay logged
+ *                                        in across restarts (this is the server mode)
+ *   browser --dry-run                    print the Chrome command line, launch nothing
  *   browser status | browser close | browser use <real|private>
  *   close [tab] [--mine|--all] | stop
  *   bench [--runs N] [--full] [--writes-only] [--json]   measure real latency
@@ -42,9 +45,20 @@
  *   --full                   screenshot: full page
  *   --fast                   skip the human pacing (see the pacing section)
  *   --headed                 browser: visible window instead of headless
+ *   --profile-dir <dir>      browser: keep the profile here (logins survive)
+ *   --dry-run                browser: print the command line, launch nothing
  *   --chrome <path>          browser: which Chrome/Chromium binary to launch
  *   --browser                cdp: send at browser level instead of the tab
  *   --port <cdpPort>         override the discovered CDP port
+ *
+ * Environment:
+ *   PALMIFER_CHROME          Chrome/Chromium binary to launch
+ *   PALMIFER_CHROME_FLAGS    extra Chrome flags, e.g. "--lang=zh-CN --window-size=1280,900"
+ *   PALMIFER_PROFILE_DIR     same as --profile-dir
+ *   PALMIFER_FAST=1          disable human pacing
+ *   PALMIFER_ACTION_CAP      burst cap per 10 min (default 80)
+ *   PALMIFER_DAEMON_PORT     default 8798
+ *   PALMIFER_STATE_DIR       default ~/.cache/palmifer
  */
 
 import {
@@ -55,11 +69,13 @@ import {
   openSync,
   rmSync,
   mkdtempSync,
+  statfsSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, delimiter } from "node:path";
+import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromeLaunchFlags, shmSizeMb, sandboxUnavailable } from "./launch-flags.mjs";
 import { spawn } from "node:child_process";
 import http from "node:http";
 
@@ -130,6 +146,7 @@ const VALUED = new Set([
   "timeout",
   "seconds",
   "chrome",
+  "profile-dir",
 ]);
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -486,6 +503,25 @@ class Cdp {
 
 let conn = null;
 let connUrl = null;
+
+/** Can we actually open a WebSocket to this endpoint right now? */
+async function canConnect(url, timeoutMs = 1500) {
+  return new Promise((res) => {
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws.close();
+      } catch {}
+      res(ok);
+    };
+    const ws = new WebSocket(url);
+    ws.addEventListener("open", () => finish(true), { once: true });
+    ws.addEventListener("error", () => finish(false), { once: true });
+    setTimeout(() => finish(false), timeoutMs);
+  });
+}
 
 /** Drop the live connection so the next command re-resolves the endpoint. */
 function resetConn() {
@@ -1411,6 +1447,7 @@ const commands = {
             headless: p.headless,
             endpoint: p.endpoint,
             profileDir: p.profileDir,
+            persistent: !!p.persistent,
             startedAt: p.startedAt,
           }
         : { running: false };
@@ -1427,7 +1464,9 @@ const commands = {
         private: info(),
         tabs,
         note: p
-          ? `use \`palmifer browser close\` to delete the throwaway profile (${p.profileDir})`
+          ? p.persistent
+            ? `\`--profile-dir\` profile, kept across restarts (${p.profileDir})`
+            : `use \`palmifer browser close\` to delete the throwaway profile (${p.profileDir})`
           : "`palmifer browser` starts a throwaway browser; without it palmifer drives your own",
       });
       return;
@@ -1449,6 +1488,21 @@ const commands = {
     if (sub === "close" || args.stop) {
       const p = readJson(PRIVATE_FILE);
       let stopped = false;
+      let graceful = false;
+      if (p && p.pid && pidAlive(p.pid)) {
+        // Ask the browser to close itself first. A SIGTERM to the process group
+        // works, but it interrupts the profile's writes: cookies and
+        // localStorage set during the session may never reach disk, which is
+        // exactly what a `--profile-dir` user is keeping the profile for.
+        if (activeMode() === "private") {
+          try {
+            const cdp = await getConn();
+            await cdp.send("Browser.close");
+            graceful = true;
+            for (let i = 0; i < 50 && pidAlive(p.pid); i++) await sleep(100);
+          } catch {}
+        }
+      }
       if (p && p.pid && pidAlive(p.pid)) {
         // detached, so the pid is the process-group leader: one signal reaps the
         // whole browser, helper processes included.
@@ -1472,23 +1526,37 @@ const commands = {
         stopped = true;
       }
       // Only ever delete a directory we created, and only one that looks like it.
+      // `--profile-dir` profiles are the user's: closing the browser keeps them,
+      // which is how a login survives on a server.
       let profileRemoved = false;
-      if (p && typeof p.profileDir === "string" && p.profileDir.includes("palmifer-private-")) {
+      let profileKept = null;
+      const deletable =
+        p && !p.persistent && typeof p.profileDir === "string" && p.profileDir.includes("palmifer-private-");
+      if (deletable) {
         try {
           rmSync(p.profileDir, { recursive: true, force: true });
           profileRemoved = !existsSync(p.profileDir);
         } catch {}
+      } else if (p && p.profileDir) {
+        profileKept = p.profileDir;
       }
       rmSync(PRIVATE_FILE, { force: true });
       setMode("real");
       resetConn();
       delete state.anonContexts.private; // it died with the process we just killed
       forgetTabs();
-      out({ private: stopped ? "stopped" : "was not running", profileRemoved, mode: "real", endpoint: resolveEndpoint() });
+      out({
+        private: stopped ? "stopped" : "was not running",
+        graceful,
+        profileRemoved,
+        ...(profileKept ? { profileKept, note: "kept on purpose: `--profile-dir` profiles hold your logins" } : {}),
+        mode: "real",
+        endpoint: resolveEndpoint(),
+      });
       return;
     }
 
-    if (sub && !URLISH) fail(`usage: palmifer browser [url] [--headed] | browser <status|close|use>`);
+    if (sub && !URLISH) fail(`usage: palmifer browser [url] [--headed] [--profile-dir <dir>] | browser <status|close|use>`);
 
     const existing = privateBrowser();
     if (existing && !args.restart) {
@@ -1514,43 +1582,81 @@ const commands = {
     }
     // A crashed run leaves a temp profile behind; drop it before making a new one.
     const stale = readJson(PRIVATE_FILE);
-    if (stale && stale.profileDir && !pidAlive(stale.pid || 0) && String(stale.profileDir).includes("palmifer-private-")) {
+    if (
+      stale &&
+      !stale.persistent &&
+      stale.profileDir &&
+      !pidAlive(stale.pid || 0) &&
+      String(stale.profileDir).includes("palmifer-private-")
+    ) {
       try {
         rmSync(stale.profileDir, { recursive: true, force: true });
       } catch {}
     }
 
     const headless = !args.headed;
-    const profileDir = mkdtempSync(join(tmpdir(), "palmifer-private-"));
+    // `--profile-dir` (or PALMIFER_PROFILE_DIR) makes the profile permanent, so
+    // a server can log in once and stay logged in across restarts.
+    const wantedProfile = args["profile-dir"] || process.env.PALMIFER_PROFILE_DIR;
+    const persistent = !!wantedProfile;
+    const profileDir = persistent
+      ? resolve(String(wantedProfile))
+      : mkdtempSync(join(tmpdir(), "palmifer-private-"));
     const portFile = join(profileDir, "DevToolsActivePort");
+    const targetUrl = sub && URLISH && sub !== "about:blank" ? sub : "about:blank";
+    const platform = process.platform;
+    const flags = chromeLaunchFlags({
+      profileDir,
+      url: targetUrl,
+      headless,
+      platform,
+      noSandbox: sandboxUnavailable({
+        platform,
+        uid: typeof process.getuid === "function" ? process.getuid() : undefined,
+        readFileSync,
+      }),
+      shmMb: platform === "linux" ? shmSizeMb(statfsSync, "/dev/shm") : null,
+      extra: process.env.PALMIFER_CHROME_FLAGS || "",
+    });
+
+    if (args["dry-run"]) {
+      out({
+        dryRun: true,
+        wouldRun: bin,
+        args: flags,
+        headless,
+        profileDir,
+        persistent,
+        note: "nothing was launched and the active browser was not switched",
+      });
+      return;
+    }
+
+    mkdirSync(profileDir, { recursive: true });
     mkdirSync(STATE_DIR, { recursive: true });
     const log = openSync(join(STATE_DIR, "private.log"), "a");
-    const child = spawn(
-      bin,
-      [
-        `--user-data-dir=${profileDir}`,
-        "--remote-debugging-port=0",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--no-service-autorun",
-        "--disable-sync",
-        "--disable-background-networking",
-        "--use-mock-keychain",
-        "--password-store=basic",
-        ...(headless ? ["--headless=new", "--disable-gpu"] : []),
-        sub && URLISH && sub !== "about:blank" ? sub : "about:blank",
-      ],
-      { detached: true, stdio: ["ignore", log, log] },
-    );
+    const child = spawn(bin, flags, { detached: true, stdio: ["ignore", log, log] });
     child.unref();
 
+    // A --profile-dir that has been used before still holds the DevToolsActivePort
+    // of the *previous* run, pointing at a port that is long gone. Reading it back
+    // would "find" an endpoint that cannot be connected to, so clear it first and
+    // only trust a file Chrome wrote for this launch.
+    rmSync(portFile, { force: true });
+
     let endpoint = null;
-    for (let i = 0; i < 120; i++) {
+    const deadline = Date.now() + 20000;
+    while (Date.now() < deadline) {
       if (existsSync(portFile)) {
         const [port, path] = readFileSync(portFile, "utf8").trim().split("\n");
         if (port && path) {
-          endpoint = `ws://127.0.0.1:${port.trim()}${path.trim()}`;
-          break;
+          const candidate = `ws://127.0.0.1:${port.trim()}${path.trim()}`;
+          // Prove it is live before reporting success: private browsers need no
+          // approval, so a plain connection here is cheap and side-effect free.
+          if (await canConnect(candidate, 1500)) {
+            endpoint = candidate;
+            break;
+          }
         }
       }
       if (child.exitCode !== null) break;
@@ -1560,11 +1666,15 @@ const commands = {
       try {
         process.kill(-child.pid, "SIGKILL");
       } catch {}
-      rmSync(profileDir, { recursive: true, force: true });
-      fail("the throwaway browser never opened a CDP port — see ~/.cache/palmifer/private.log");
+      // Never delete a profile the user asked us to keep.
+      if (!persistent) rmSync(profileDir, { recursive: true, force: true });
+      fail(
+        "the browser never opened a CDP port — see ~/.cache/palmifer/private.log\n" +
+          "`palmifer browser --dry-run` prints the exact command line that was used.",
+      );
     }
 
-    writeJson(PRIVATE_FILE, { pid: child.pid, endpoint, headless, profileDir, startedAt: Date.now() });
+    writeJson(PRIVATE_FILE, { pid: child.pid, endpoint, headless, profileDir, persistent, startedAt: Date.now() });
     setMode("private");
     resetConn();
     forgetTabs();
@@ -1584,8 +1694,11 @@ const commands = {
       pid: child.pid,
       endpoint,
       profileDir,
+      persistent,
       tabs: (await pageTargets(cdp)).length,
-      note: "this browser is brand new: no logins, no cookies. `palmifer browser close` stops it and deletes the profile.",
+      note: persistent
+        ? "this profile is permanent: log in once and it survives `browser close` and restarts."
+        : "this browser is brand new: no logins, no cookies. `palmifer browser close` stops it and deletes the profile.",
     });
   },
 

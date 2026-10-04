@@ -20,10 +20,11 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { chromeLaunchFlags, sandboxUnavailable } from "../bin/launch-flags.mjs";
 
 const CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "palmifer.mjs");
 const STATE_DIR = mkdtempSync(join(tmpdir(), "palmifer-test-state-"));
@@ -92,6 +93,41 @@ function cleanup() {
 try {
   await new Promise((r) => setTimeout(r, 600));
   console.log(`state dir: ${STATE_DIR}`);
+
+  // The launch flags are the part that has to be right on a Linux VPS, where
+  // this test cannot run. Every input is explicit, so every combination is
+  // asserted here instead.
+  console.log("\nlaunch flags (Linux/container combinations are asserted, not guessed)");
+  const flagsFor = (o) => chromeLaunchFlags({ profileDir: "/p", ...o });
+  check("headless by default", flagsFor({}).includes("--headless=new"));
+  check("--headed drops it", !flagsFor({ headless: false }).some((f) => f.startsWith("--headless")));
+  check("profile dir is passed through", flagsFor({ profileDir: "/data/p" }).includes("--user-data-dir=/data/p"));
+  check("linux + root gets --no-sandbox", flagsFor({ platform: "linux", noSandbox: true }).includes("--no-sandbox"));
+  check("linux + normal user keeps the sandbox", !flagsFor({ platform: "linux" }).includes("--no-sandbox"));
+  check("macOS never gets --no-sandbox", !flagsFor({ platform: "darwin", noSandbox: true }).includes("--no-sandbox"));
+  check("small /dev/shm gets --disable-dev-shm-usage", flagsFor({ platform: "linux", shmMb: 64 }).includes("--disable-dev-shm-usage"));
+  check("roomy /dev/shm does not", !flagsFor({ platform: "linux", shmMb: 2048 }).includes("--disable-dev-shm-usage"));
+  check("unknown /dev/shm does not", !flagsFor({ platform: "linux", shmMb: null }).includes("--disable-dev-shm-usage"));
+  check("PALMIFER_CHROME_FLAGS is appended", flagsFor({ extra: "--lang=zh-CN --window-size=1280,900" }).includes("--lang=zh-CN"));
+  check("url stays last", flagsFor({ url: "https://x.test/" }).at(-1) === "https://x.test/");
+  check("root is detected on linux", sandboxUnavailable({ platform: "linux", uid: 0, readFileSync }) === true);
+  check("non-root with userns on is fine", sandboxUnavailable({ platform: "linux", uid: 1000, readFileSync }) === false);
+  check(
+    "userns-off kernel needs --no-sandbox",
+    sandboxUnavailable({ platform: "linux", uid: 1000, readFileSync: () => "0\n" }) === true,
+  );
+  check("missing userns knob is not treated as broken", sandboxUnavailable({ platform: "linux", uid: 1000, readFileSync: () => { throw new Error("ENOENT"); } }) === false);
+  check("macOS sandbox is never reported unavailable", sandboxUnavailable({ platform: "darwin", uid: 0, readFileSync }) === false);
+
+  console.log("\nbrowser --dry-run prints the command line and launches nothing");
+  const dry = palmifer("browser", "--dry-run", "--profile-dir", join(STATE_DIR, "dry-profile"));
+  check("dry run is marked as such", dry.json?.dryRun === true, dry.text);
+  check("dry run reports the binary", /Chrome|Chromium/.test(dry.json?.wouldRun || ""), dry.json?.wouldRun);
+  check("dry run reports a headless command line", (dry.json?.args || []).includes("--headless=new"));
+  check("dry run reports the profile dir", dry.json?.profileDir === join(STATE_DIR, "dry-profile"), dry.json?.profileDir);
+  check("dry run started nothing", !existsSync(join(STATE_DIR, "private.json")), "private.json exists");
+  check("dry run did not switch browser", palmifer("browser", "status").json?.mode === "real");
+
 
   console.log("\nthrowaway browser (headless, no opt-in, no login)");
   const start = palmifer("browser");
@@ -177,6 +213,37 @@ try {
 
   const finalStatus = palmifer("browser", "status");
   check("status no longer sees a private browser", finalStatus.json?.private?.running === false, finalStatus.text);
+
+  // This is the server story: log in once, keep the profile, stay logged in
+  // across a full browser restart. The cookie is the login.
+  console.log("\n--profile-dir keeps the profile, and the login in it, across restarts");
+  const permDir = join(STATE_DIR, "perm-profile");
+  const first = palmifer("browser", "--profile-dir", permDir, PROBE_URL);
+  check("persistent profile reported as persistent", first.json?.persistent === true, first.text);
+  check("persistent profile is not a temp dir", !/palmifer-private-/.test(first.json?.profileDir || ""), first.json?.profileDir);
+  // max-age matters: a plain document.cookie is a *session* cookie and is
+  // supposed to die with the browser, so it would prove nothing here.
+  const permCookie = palmifer("eval", `document.cookie="palmifer_persist=1;max-age=86400;path=/";document.cookie`);
+  check("cookie set inside the persistent profile", permCookie.text.includes("palmifer_persist=1"), permCookie.text);
+  const permLocal = palmifer("eval", `localStorage.setItem("palmifer_token","abc");localStorage.getItem("palmifer_token")`);
+  check("localStorage written in the persistent profile", permLocal.text.includes("abc"), permLocal.text);
+  const permClosed = palmifer("browser", "close");
+  check("closing keeps a --profile-dir profile", permClosed.json?.profileRemoved === false, JSON.stringify(permClosed.json));
+  check("closing says which profile it kept", permClosed.json?.profileKept === permDir, permClosed.json?.profileKept);
+  check("profile really is still on disk", existsSync(join(permDir, "DevToolsActivePort")) || existsSync(join(permDir, "Default")), permDir);
+
+  const second = palmifer("browser", "--profile-dir", permDir, PROBE_URL);
+  check("browser restarted on the same profile", second.json?.persistent === true, second.text);
+  const survived = palmifer("eval", "document.cookie");
+  check("the cookie survived a full browser restart", survived.text.includes("palmifer_persist=1"), survived.text);
+  const survivedLocal = palmifer("eval", `localStorage.getItem("palmifer_token")`);
+  check("localStorage survived a full browser restart", survivedLocal.text.includes("abc"), survivedLocal.text);
+  // Graceful shutdown is what makes the two checks above possible: SIGTERM to
+  // the process group kills the profile's writes before they reach disk.
+  const permClosed2 = palmifer("browser", "close");
+  check("close asked the browser to shut down gracefully", permClosed2.json?.graceful === true, JSON.stringify(permClosed2.json));
+  const permGone = palmifer("browser", "status");
+  check("after the last close there is no private browser", permGone.json?.private?.running === false);
 } catch (e) {
   failures++;
   console.error(`\nunexpected error: ${e.stack || e}`);
