@@ -45,6 +45,8 @@ palmifer status
 
 卸载：`rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
 
+**授权**：Chrome 是**按连接方**逐次授权的 —— daemon 启动时连一次，所以是「每次 daemon 启动点一次 Allow」，之后的命令都不再弹窗。
+
 **测速**：`palmifer bench` 只跑只读命令，把延迟拆成三层（进程启动 / daemon HTTP / 真实 CDP 往返），并单独测冷启动。
 
 **默认行为**：按"人的节奏"操作——带缓动的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔，也不让连续操作过密。只读任务可以用 `--fast` 跳过等待。
@@ -69,7 +71,7 @@ Chrome 136+ refuses `--remote-debugging-port` on the default profile. Chrome 155
 palmifer speaks CDP to that endpoint:
 
 - **One file.** `bin/palmifer.mjs` is the whole CLI and daemon — Node >= 22, no dependency tree, no build step.
-- **One connection.** Chrome asks for approval whenever a new client connects, so a long-lived daemon holds the single CDP session: you click *Allow* once, not once per command.
+- **One connection.** Chrome asks for approval whenever a new client connects, so a long-lived daemon holds the single CDP session: you click *Allow* once per daemon start, not once per command.
 - **Real input.** Clicks and typing go through the browser's own input pipeline, so pages that reject synthetic events behave normally.
 - **Human-paced by default.** An eased pointer path, character-by-character typing, a pause after navigation, spacing between actions and a cap on action bursts. `--fast` opts out for read-only work.
 - **Nothing to escape.** `cdp <Domain.method>` passes any raw CDP command through when the built-in commands are not enough.
@@ -122,6 +124,7 @@ The daemon starts itself on the first command and listens on `127.0.0.1:8798`; s
 palmifer bench              # 8 runs per cell, read-only commands only
 palmifer bench --runs 20    # more runs, tighter medians
 palmifer bench --json       # machine-readable
+palmifer bench --cold       # also measure a cold start (see below)
 ```
 
 Three layers are measured separately, because they have three different causes:
@@ -132,6 +135,25 @@ Three layers are measured separately, because they have three different causes:
 | `cli` | `bin/palmifer.mjs` — the same command with Node's startup added |
 | `http` | the daemon's own `POST /run` — no process spawn, so this is close to the raw CDP round trip |
 
+A run on the author's machine (macOS arm64, Node 26, Chrome 155), 10 runs per cell:
+
+```
+command       path           min     median        max
+status        shim       36.0 ms    37.1 ms    40.6 ms
+status        cli         127 ms     129 ms     132 ms
+status        http        1.0 ms     1.5 ms    39.0 ms
+tabs          shim       36.1 ms    37.6 ms    39.1 ms
+tabs          cli         127 ms     129 ms     149 ms
+tabs          http        0.6 ms     0.7 ms     1.6 ms
+eval 1+1      shim       38.7 ms    40.7 ms    44.1 ms
+eval 1+1      cli         128 ms     130 ms     133 ms
+eval 1+1      http        2.4 ms     2.6 ms     4.3 ms
+```
+
+What that says: a CDP round trip through the daemon is **1–3 ms**. The shim's extra ~36 ms is curl + jq + one process; the Node CLI's extra ~130 ms is Node's own startup. Process startup, not the browser, is the cost — which is why `bin/palmifer` exists at all.
+
+`--cold` is off by default for a reason: it restarts the daemon, Chrome sees a new client and asks for approval again, and your click would land inside the measurement.
+
 `cli - shim` is what Node's startup costs, `shim - http` is what starting curl + jq costs. A **cold start** row (daemon stopped first) shows the cost of spawning the daemon, the CDP handshake and the first answer together.
 
 Only read-only commands (`status`, `tabs`, `eval`) are used, so it is safe to run against a live browser.
@@ -139,6 +161,7 @@ Only read-only commands (`status`, `tabs`, `eval`) are used, so it is safe to ru
 ## Notes
 
 - The opt-in is **per browser instance** and resets when Chrome restarts.
+- Chrome approves **per connecting client**, so it is one *Allow* per daemon start: after `palmifer stop`, or after the daemon exits, the next command asks again. Commands never ask.
 - Loopback only: the daemon binds `127.0.0.1`, requires the token it writes on first run to `~/.cache/palmifer/token`, and rejects non-loopback hosts.
 - While the toggle is on, Chrome shows a "being controlled by automated test software" banner.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.

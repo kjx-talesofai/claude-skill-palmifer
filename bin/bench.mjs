@@ -13,7 +13,7 @@
  * starting curl+jq costs, and `http` is close to the real CDP round trip.
  *
  * Usage:
- *   palmifer bench [--runs N] [--command "status"|"eval 1+1"|...] [--json]
+ *   palmifer bench [--runs N] [--command "status"|"eval 1+1"|...] [--json] [--cold]
  *
  * Only read-only commands are benchmarked by default (status, tabs, eval). Nothing
  * here clicks, types or navigates, so it is safe to run against a live browser.
@@ -33,6 +33,7 @@ const TOKEN_FILE = join(homedir(), ".cache", "palmifer", "token");
 
 const argv = process.argv.slice(2);
 const asJson = argv.includes("--json");
+const wantCold = argv.includes("--cold");
 const runsArg = argv.indexOf("--runs");
 const RUNS = runsArg >= 0 ? Math.max(1, Number(argv[runsArg + 1]) || 8) : 8;
 const cmdArg = argv.indexOf("--command");
@@ -119,13 +120,15 @@ for (const command of COMMANDS) {
   results.push(rows);
 }
 
-// Cold: the daemon is stopped, so the first command pays for spawning it, for the
-// CDP handshake, and for the command itself.
-spawnSync(process.execPath, [CLI, "stop"], { stdio: "ignore" });
-await new Promise((r) => setTimeout(r, 300));
-const cold = timeProcess(process.execPath, [CLI, "status"]);
-// Leave the daemon warm for the next command the user runs.
-spawnSync(SHIM, ["status"], { stdio: "ignore" });
+// Cold is opt-in, because restarting the daemon makes Chrome treat it as a new
+// client and ask for approval again — any click lands inside the measurement.
+let cold = null;
+if (wantCold) {
+  spawnSync(process.execPath, [CLI, "stop"], { stdio: "ignore" });
+  await new Promise((r) => setTimeout(r, 300));
+  cold = timeProcess(process.execPath, [CLI, "status"]);
+  spawnSync(SHIM, ["status"], { stdio: "ignore" });
+}
 
 if (asJson) {
   console.log(JSON.stringify({ node: process.version, platform: `${process.platform} ${process.arch}`, browser: info.browser, tabs: info.tabs, runs: RUNS, cold, results }, null, 2));
@@ -144,7 +147,9 @@ if (asJson) {
     }
   }
   console.log("");
-  console.log(`cold start (daemon spawn + CDP connect + first answer): ${f(cold)}`);
+  console.log(cold === null
+    ? "cold start: skipped (pass --cold to measure it; Chrome may ask you to approve the new client, and your click would land in the number)"
+    : `cold start (daemon spawn + CDP connect + first answer): ${f(cold)}`);
   console.log("");
   console.log("cli − shim ≈ Node startup · shim − http ≈ curl+jq startup · http ≈ CDP round trip");
 }
