@@ -152,6 +152,19 @@ eval 1+1      http        2.4 ms     2.6 ms     4.3 ms
 
 What that says: a CDP round trip through the daemon is **1–3 ms**. The shim's extra ~36 ms is curl + jq + one process; the Node CLI's extra ~130 ms is Node's own startup. Process startup, not the browser, is the cost — which is why `bin/palmifer` exists at all.
 
+Writes cost real time by design — that is the "look human" budget, spent on purpose:
+
+| action | `--fast` | default (paced) |
+|---|---|---|
+| `fill` a 2-character value | 43 ms | ~1.4 s |
+| `click` a button | 43 ms | ~1.1 s |
+| `snapshot` (300-row page) | — | 91 ms |
+| `screenshot` | 65 ms | 65 ms |
+
+The paced numbers are one spacing gap (≥1.2 s between write actions), per-character typing (45–140 ms) and an eased pointer path. `--fast` skips the waiting; use it for read-only work or when speed matters more than looking like a person.
+
+The daemon itself sits at ~97 MB RSS while holding a live CDP connection — Node's baseline, not the payload.
+
 `--cold` is off by default for a reason: it restarts the daemon, Chrome sees a new client and asks for approval again, and your click would land inside the measurement.
 
 `cli - shim` is what Node's startup costs, `shim - http` is what starting curl + jq costs. A **cold start** row (daemon stopped first) shows the cost of spawning the daemon, the CDP handshake and the first answer together.
