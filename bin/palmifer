@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# palmifer — zero-boot fast path to the palmifer daemon.
+#
+# The Node CLI costs ~120ms per call, almost all of it Node's own startup. This
+# shim posts the same JSON to the already-running daemon with curl + jq, which
+# measures ~10ms. It auto-starts the daemon (via the Node CLI) when needed, and
+# is otherwise a drop-in for the simple commands.
+#
+# Usage: palmifer <command> [args...] [--tab X] [--frame '#f0'] [--limit N] ...
+#        palmifer status | palmifer snapshot --actionable-only | palmifer eval '1+1'
+#        palmifer network list --filter api
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+node_cli="$here/palmifer.mjs"
+PORT="${PALMIFER_DAEMON_PORT:-8798}"
+TOKEN_FILE="${HOME}/.cache/palmifer/token"
+orig=("$@")
+
+command -v jq >/dev/null 2>&1 || exec node "$node_cli" "${orig[@]}"
+command -v curl >/dev/null 2>&1 || exec node "$node_cli" "${orig[@]}"
+
+cmd="${1:-}"
+[ -n "$cmd" ] || exec node "$node_cli" "${orig[@]}"
+shift || true
+
+positional=()
+flags='{}'
+VALUED=" tab frame limit max port session filter timeout seconds text "
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --*)
+      name="${1#--}"
+      if [ "${VALUED#* $name }" != "$VALUED" ]; then
+        flags=$(jq -c --arg k "$name" --arg v "${2:-}" '. + {($k):$v}' <<<"$flags")
+        shift 2
+      else
+        flags=$(jq -c --arg k "$name" '. + {($k):true}' <<<"$flags")
+        shift
+      fi
+      ;;
+    *) positional+=("$1"); shift ;;
+  esac
+done
+
+# Auto-start the daemon (Node CLI knows how) when it is not listening yet.
+if ! curl -s -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
+  exec node "$node_cli" "${orig[@]}"
+fi
+
+body=$(jq -nc --arg cmd "$cmd" --argjson flags "$flags" \
+  '{cmd:$cmd, args:$flags, positional:$ARGS.positional}' --args "${positional[@]:-}")
+
+TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
+resp=$(curl -s -X POST "http://127.0.0.1:$PORT/run" \
+  -H 'content-type: application/json' -H "x-palmifer-token: $TOKEN" --data-binary "$body")
+
+out=$(jq -r '.output // empty' <<<"$resp")
+[ -n "$out" ] && printf '%s\n' "$out"
+err=$(jq -r '.error // empty' <<<"$resp")
+if [ -n "$err" ]; then
+  printf '%s\n' "$err" >&2
+  exit 1
+fi
