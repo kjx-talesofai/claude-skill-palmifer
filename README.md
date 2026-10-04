@@ -12,6 +12,33 @@ Let an AI agent drive **your** Chrome — the one you are already signed into �
 
 > palmifer -- 泡米饭
 
+<details>
+<summary><b>中文说明（点开）</b> —— 用你已经登录的真 Chrome，让 agent 替你浏览、读页面、点击、填表、截图</summary>
+
+**它是什么**：一个本地命令行工具加一个常驻小 daemon，让 AI agent 通过 CDP 操作**你自己那个已登录的 Chrome**。没有浏览器扩展，没有账号，没有云。
+
+**为什么做**：以前我一直用 kimi-webbridge，它第一次让 agent 能"以你的身份"在真浏览器里干活。后来它长成了一个更完整的产品（自带账号和侧边栏）——对产品来说是好事，只是不再是我要的那座中立的桥。有点可惜，毕竟以前天天用。所以 palmifer 是这件事的"小版本"：**只做桥**。
+
+**首次设置**（每个 Chrome 会话做一次）：
+
+1. 打开 `chrome://inspect/#remote-debugging`
+2. 勾选 **"Allow remote debugging for this browser instance"**
+3. Chrome 询问是否允许连接时，点 **Allow**
+
+```bash
+git clone https://github.com/kjx-talesofai/claude-skill-palmifer.git ~/.agents/skills/palmifer
+export PATH="$HOME/.agents/skills/palmifer/bin:$PATH"
+palmifer status
+```
+
+**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer click "button"` 点击 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
+
+**注意事项**：那个开关是**按浏览器实例**生效的，Chrome 重启后要重新勾选；daemon 只监听 `127.0.0.1`，请求必须带首次运行时写入 `~/.cache/palmifer/token` 的令牌；目前只在 macOS 上实测过。卸载：`rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
+
+**默认行为**：按"人的节奏"操作——真实的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔、并限制突发频率。只读任务可以用 `--fast` 跳过等待。
+
+</details>
+
 ```
 agent ── bash ──▶ palmifer ── HTTP ──▶ daemon ── CDP ──▶ your Chrome
                     (CLI)             127.0.0.1          (your logins)
