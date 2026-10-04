@@ -22,6 +22,11 @@ command -v curl >/dev/null 2>&1 || exec node "$node_cli" "${orig[@]}"
 
 cmd="${1:-}"
 [ -n "$cmd" ] || exec node "$node_cli" "${orig[@]}"
+
+# Commands only the Node CLI implements — they do not talk to the daemon.
+case "$cmd" in
+  stop|help|version|--help|-h|--version) exec node "$node_cli" "${orig[@]}" ;;
+esac
 shift || true
 
 positional=()
@@ -60,6 +65,8 @@ out=$(jq -r '.output // empty' <<<"$resp")
 [ -n "$out" ] && printf '%s\n' "$out"
 err=$(jq -r '.error // empty' <<<"$resp")
 if [ -n "$err" ]; then
+  # Safety net: anything the daemon does not implement is the full CLI's job.
+  case "$err" in *"unknown command"*) exec node "$node_cli" "${orig[@]}" ;; esac
   printf '%s\n' "$err" >&2
   exit 1
 fi

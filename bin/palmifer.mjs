@@ -324,6 +324,8 @@ class Cdp {
     };
   }
   send(method, params = {}, sessionId) {
+    // A closed socket discards writes silently; say so instead of hanging.
+    if (this.closed) return Promise.reject(new Error(INSPECT_HINT));
     return new Promise((resolve, reject) => {
       const id = ++this.id;
       const timer = setTimeout(() => {
@@ -344,7 +346,7 @@ async function getConn() {
   const ws = new WebSocket(url);
   await new Promise((res, rej) => {
     ws.addEventListener("open", res, { once: true });
-    ws.addEventListener("error", () => rej(new Error(`cannot reach ${url}`)), { once: true });
+    ws.addEventListener("error", () => rej(new Error(`cannot reach Chrome at ${url}\n${INSPECT_HINT}`)), { once: true });
     const t = setTimeout(() => rej(new Error(INSPECT_HINT)), 120000);
     ws.addEventListener("open", () => clearTimeout(t), { once: true });
   });
