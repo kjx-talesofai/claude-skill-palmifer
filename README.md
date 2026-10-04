@@ -24,6 +24,9 @@ Let an AI agent drive **your** Chrome — the one you are already signed into �
 3. Chrome 询问是否允许连接时，点 **Allow**
 
 ```bash
+# 推荐：装为 agent 技能
+npx skills add kjx-talesofai/claude-skill-palmifer -g -a cline
+# 或者直接 clone
 git clone https://github.com/kjx-talesofai/claude-skill-palmifer.git ~/.agents/skills/palmifer
 export PATH="$HOME/.agents/skills/palmifer/bin:$PATH"
 palmifer status
@@ -70,6 +73,14 @@ palmifer speaks CDP to that endpoint:
 - **Nothing to escape.** `cdp <Domain.method>` passes any raw CDP command through when the built-in commands are not enough.
 
 ## Install
+
+Install it as a skill (any agent that reads `~/.agents/skills`):
+
+```bash
+npx skills add kjx-talesofai/claude-skill-palmifer -g -a cline
+```
+
+Or clone it by hand:
 
 ```bash
 git clone https://github.com/kjx-talesofai/claude-skill-palmifer.git ~/.agents/skills/palmifer
