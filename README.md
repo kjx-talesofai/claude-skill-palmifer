@@ -12,14 +12,16 @@ Let an AI agent drive **your** Chrome — the one you are already signed into �
 
 > palmifer -- 泡米饭
 
+<!-- 维护提醒：改动下面英文的安装步骤 / 注意事项时，请同步更新这个中文折叠块（两者事实必须一致）。 -->
+
 <details>
-<summary><b>中文说明（点开）</b> —— 用你已经登录的真 Chrome，让 agent 替你浏览、读页面、点击、填表、截图</summary>
+<summary><b>中文说明（点开）</b> —— 用你已登录的 Chrome，让 agent 替你打开网页、点击、填表、截图</summary>
 
 **它是什么**：一个本地命令行工具加一个常驻小 daemon，让 AI agent 通过 CDP 操作**你自己那个已登录的 Chrome**。没有浏览器扩展，没有账号，没有云。
 
-**为什么做**：以前我一直用 kimi-webbridge，它第一次让 agent 能"以你的身份"在真浏览器里干活。后来它长成了一个更完整的产品（自带账号和侧边栏）——对产品来说是好事，只是不再是我要的那座中立的桥。有点可惜，毕竟以前天天用。所以 palmifer 是这件事的"小版本"：**只做桥**。
+**为什么做**：以前我一直用 kimi-webbridge，它第一次让 agent 能"以你的身份"在真浏览器里干活。后来它长成了一个更完整的产品（自带账号和侧边栏）——对产品来说是好事，只是不再是我要的那座中立的桥。有点可惜，毕竟以前天天用。所以 palmifer 就是把这件事做小：**只做桥**。
 
-**首次设置**（每个 Chrome 会话做一次）：
+**开启调试**（每个 Chrome 会话都要做一次）：
 
 1. 打开 `chrome://inspect/#remote-debugging`
 2. 勾选 **"Allow remote debugging for this browser instance"**
@@ -31,11 +33,20 @@ export PATH="$HOME/.agents/skills/palmifer/bin:$PATH"
 palmifer status
 ```
 
+需要 Node ≥ 22（自带 fetch 与 WebSocket），不需要 npm install。
+
 **常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer click "button"` 点击 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
 
-**注意事项**：那个开关是**按浏览器实例**生效的，Chrome 重启后要重新勾选；daemon 只监听 `127.0.0.1`，请求必须带首次运行时写入 `~/.cache/palmifer/token` 的令牌；目前只在 macOS 上实测过。卸载：`rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
+**注意事项**：
 
-**默认行为**：按"人的节奏"操作——真实的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔、并限制突发频率。只读任务可以用 `--fast` 跳过等待。
+- 那个开关**按浏览器实例**生效，Chrome 重启后要重新勾选。
+- 开着开关时 Chrome 会显示「正受到自动测试软件的控制」横幅，属正常现象。
+- daemon 只监听 `127.0.0.1`；每个请求都要带令牌，令牌在首次运行时写入 `~/.cache/palmifer/token`。
+- 目前只在 macOS 上实测；Linux 的路径已写好，但没验证过。
+
+卸载：`rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
+
+**默认行为**：按"人的节奏"操作——带缓动的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔，也不让连续操作过密。只读任务可以用 `--fast` 跳过等待。
 
 </details>
 
@@ -99,7 +110,7 @@ The daemon starts itself on the first command and listens on `127.0.0.1:8798`; s
 ## Notes
 
 - The opt-in is **per browser instance** and resets when Chrome restarts.
-- Loopback only: the daemon binds `127.0.0.1`, requires the token it writes on first run to `~/.cache/palmifer/`, and rejects non-loopback hosts.
+- Loopback only: the daemon binds `127.0.0.1`, requires the token it writes on first run to `~/.cache/palmifer/token`, and rejects non-loopback hosts.
 - While the toggle is on, Chrome shows a "being controlled by automated test software" banner.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
 
