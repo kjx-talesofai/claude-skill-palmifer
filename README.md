@@ -34,7 +34,17 @@ palmifer status
 
 需要 Node ≥ 22（自带 fetch 与 WebSocket），不需要 npm install。
 
-**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer click "button"` 点击 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
+**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer press Enter` 回车提交 · `palmifer click "button"` 点击 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
+
+**两种浏览器**：默认操作**你自己的 Chrome**（带你所有登录态）。如果不想用你的浏览器、或者没人在旁边点 Allow（服务器、CI、无人值守），用 `palmifer browser` —— 它自己起一个全新的临时 profile 的 Chrome，**默认无头**，不用授权、没有任何你的数据；`palmifer browser close` 退出并删掉临时 profile。`palmifer anon on` 是在**当前浏览器里**开一个没有 cookie 的匿名上下文（Chrome 会为它单开一个窗口），任务跑完 `palmifer anon off` 关掉。三者区别：
+
+| | 浏览器 | 需要点 Allow | 有你的登录态 | 窗口 |
+|---|---|---|---|---|
+| 默认 | 你的 Chrome | 要，每个 daemon 一次 | 有 | 你原来的窗口 |
+| `palmifer browser` | palmifer 自己起的临时 Chrome | 不要 | 没有 | 无头（`--headed` 可开窗） |
+| `palmifer anon on` | 当前浏览器里的匿名上下文 | 同上 | 没有 | 新开一个 |
+
+匿名隔离是**测过的、不是口头保证**：`node tests/private-mode.test.mjs` 会在普通上下文里种一个 cookie、确认它重开还在，再确认匿名上下文读不到它，最后确认关掉匿名后 cookie 依然在。
 
 **注意事项**：
 
@@ -72,6 +82,7 @@ palmifer speaks CDP to that endpoint:
 
 - **One file.** `bin/palmifer.mjs` is the whole CLI and daemon — Node >= 22, no dependency tree, no build step.
 - **One connection.** Chrome asks for approval whenever a new client connects, so a long-lived daemon holds the single CDP session: you click *Allow* once per daemon start, not once per command.
+- **Your browser by default, its own when yours is not there.** `palmifer browser` starts a throwaway Chrome in a temp profile — headless, no opt-in click, no logins — for servers, CI and unattended runs. `palmifer anon on` gives the browser already in use a cookie-less context instead.
 - **Real input.** Clicks and typing go through the browser's own input pipeline, so pages that reject synthetic events behave normally.
 - **Human-paced by default.** An eased pointer path, character-by-character typing, a pause after navigation, spacing between actions and a cap on action bursts. `--fast` opts out for read-only work.
 - **Nothing to escape.** `cdp <Domain.method>` passes any raw CDP command through when the built-in commands are not enough.
@@ -99,7 +110,7 @@ Then, once per Chrome session:
 
 ```bash
 $ palmifer status
-{"ok":true,"endpoint":"ws://127.0.0.1:9222/devtools/browser/...","browser":"Chrome/155.0.8059.27","protocol":"1.3","tabs":3,"ok":true}
+{"ok":true,"mode":"real","endpoint":"ws://127.0.0.1:9222/devtools/browser/...","browser":"Chrome/155.0.8059.27","protocol":"1.3","tabs":3,"anonContext":null}
 ```
 
 Requires Node >= 22 (built-in `fetch` and `WebSocket`). There is no npm install. Tested on macOS; Linux paths are included but not tried yet.
@@ -110,6 +121,7 @@ Requires Node >= 22 (built-in `fetch` and `WebSocket`). There is no npm install.
 palmifer open "https://example.com"
 palmifer snapshot                     # accessibility tree with @eN refs
 palmifer fill @e10 "search terms"     # @eN comes from the snapshot above
+palmifer press Enter                  # real key event: Enter, Tab, Escape, Meta+A
 palmifer click "button[type=submit]"
 palmifer screenshot /tmp/page.png
 ```
@@ -117,6 +129,39 @@ palmifer screenshot /tmp/page.png
 The daemon starts itself on the first command and listens on `127.0.0.1:8798`; stop it with `palmifer stop`.
 
 `bin/palmifer` is a curl + jq shim for the common cases (~40 ms per call); `bin/palmifer.mjs` is the full CLI. Both accept every command — the shim needs `curl` and `jq`, the Node file needs nothing. The complete command and flag list lives in [SKILL.md](SKILL.md).
+
+## Two browsers, three levels of privacy
+
+| | which browser | approval click | your cookies | window |
+|---|---|---|---|---|
+| default | the one you are signed into | yes, once per daemon start | yes | the one you already have |
+| `palmifer browser` | palmifer's own Chrome, fresh temp profile | no | none | none (headless; `--headed` shows one) |
+| `palmifer anon on` | a cookie-less context in the current browser | as above | none | Chrome opens a new one |
+
+`palmifer browser` is the unattended path: nothing to approve, nothing of the
+user's on disk, and `palmifer browser close` kills the process and deletes the
+profile. That is what you want on a server, in CI, or when nobody is around to
+click *Allow*. `palmifer browser --headed` shows the window while keeping the
+throwaway profile. `palmifer browser use real` switches back without stopping
+it.
+
+`palmifer anon on` keeps working in the browser that is already open — same
+Chrome, same binary — but every tab opened from then on gets its own empty
+cookie jar, so a task can run without touching the user's sessions. On a site
+where they are logged in, the anonymous tab is logged out; `palmifer anon off`
+closes those tabs and the normal profile is exactly as it was.
+
+## Tests
+
+```bash
+node tests/private-mode.test.mjs      # 26 checks, needs Node >= 22 and Chrome
+```
+
+It uses its own daemon port and its own state directory, so it never touches the
+palmifer you use day to day, and it only ever drives the throwaway browser — your
+own Chrome is not contacted. Anonymity is checked with a real cookie: set it in
+the normal context, confirm it survives reopening there, confirm the anonymous
+context cannot see it, then confirm turning anonymity off brings it back.
 
 ## Benchmark
 
@@ -187,6 +232,8 @@ palmifer bench --writes-only        # only the write paths (isolated)
 - Chrome approves **per connecting client**, so it is one *Allow* per daemon start: after `palmifer stop`, or after the daemon exits, the next command asks again. Commands never ask.
 - Loopback only: the daemon binds `127.0.0.1`, requires the token it writes on first run to `~/.cache/palmifer/token`, and rejects non-loopback hosts.
 - While the toggle is on, Chrome shows a "being controlled by automated test software" banner.
+- The throwaway browser's profile lives under the OS temp dir and is deleted by `palmifer browser close`; a profile left behind by a crash is cleaned up on the next start.
+- Anonymous contexts live only as long as Chrome does, and only inside the browser that was current when they were created. Chrome restarting, or a `browser`/`browser use` switch, simply means running `anon on` again.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
 
 Uninstall: `rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`

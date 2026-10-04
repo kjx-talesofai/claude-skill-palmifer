@@ -1,6 +1,6 @@
 ---
 name: palmifer
-description: "Control the user's real Chrome, with their logins, over CDP — navigate, read, click, fill, screenshot."
+description: "Drive the user's real Chrome with their logins, or a throwaway headless one, over CDP — navigate, read, click, fill, screenshot."
 ---
 
 # palmifer
@@ -25,6 +25,19 @@ rather than once per command. Check it first:
 If it reports a missing endpoint, give the user that line (in their language),
 let them enable it, and retry.
 
+## Which browser
+
+| You want | Use | Why |
+|---|---|---|
+| the user's sessions | (default) | their real Chrome, their logins |
+| unattended / no window / no opt-in / CI | `browser` | palmifer starts its own Chrome in a fresh temp profile, headless; no login, nothing of theirs in it |
+| to test or scrape without touching their cookies | `anon on` | a cookie-less context inside the browser already in use (its own window) |
+
+`browser` needs no approval click; `browser --headed` shows the window,
+`browser close` stops it and deletes the profile, `browser use real|private`
+switches back and forth. `anon off` closes the anonymous tabs and returns to the
+normal profile. Say which one you used if the choice affects the user's account.
+
 ## Commands
 
 | Command | Does |
@@ -35,20 +48,24 @@ let them enable it, and retry.
 | `snapshot` | accessibility tree with `@eN` refs (`--actionable-only`, `--filter`, `--limit`) |
 | `text` | visible text of the page or a frame |
 | `click <@eN\|css>` / `fill <@eN\|css> <value>` | interact |
+| `press <Enter\|Tab\|Escape\|ArrowDown\|Meta+A>` | one real key event |
 | `eval '<js>'` | run JS, return the value |
 | `wait <css>` / `wait --text <str>` | wait until content appears |
 | `upload <@eN\|css> <file...>` | set a file input |
 | `screenshot [path] [--full]` / `pdf [path]` | capture to a file |
 | `network start\|list\|detail\|stop` | capture requests and bodies |
 | `cdp <Domain.method> ['{json}']` | raw CDP (`--browser` = browser level) |
+| `anon <on\|off\|status>` | cookie-less context, no logins |
+| `browser [url] [--headed]` / `browser status\|close\|use <real\|private>` | the throwaway browser |
 | `close [tab] [--mine\|--all]` | close tabs |
 | `stop` | stop the local daemon |
 | `bench [--runs N] [--json] [--cold]` | measure real latency; read-only |
 | `mem` | daemon memory (heap after a forced GC) |
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
-`--port`, `--fast`. `--frame` applies to `snapshot`, `text`, `eval` and `wait`; the
-other commands act on the top document and say so if a frame is requested.
+`--port`, `--fast`, `--headed`, `--chrome <path>`. `--frame` applies to `snapshot`,
+`text`, `eval` and `wait`; the other commands act on the top document and say so
+if a frame is requested.
 
 ## Defaults
 

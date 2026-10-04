@@ -11,10 +11,22 @@
  * every call. This tool keeps one long-lived local daemon holding the single
  * CDP connection: you click "Allow" once, then every command reuses it.
  *
+ * Two ways to get a browser, chosen explicitly:
+ *   (default)     the browser you already have open, with your logins. Chrome
+ *                 needs a one-time per-instance opt-in (above).
+ *   `browser`     a throwaway instance palmifer starts itself, in a brand new
+ *                 profile under the OS temp dir, headless by default. No opt-in,
+ *                 no login, nothing of yours in it. `browser close` deletes it.
+ * `anon` adds a cookie-less context *inside* whichever browser is in use, in
+ * its own window, so a task can run without touching any logged-in session.
+ *
  * Commands (run `palmifer help`):
  *   status | tabs | frames | use <tab> | open <url> | goto <url>
- *   snapshot | text | click | fill | eval | wait | upload
+ *   snapshot | text | click | fill | press <key> | eval | wait | upload
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
+ *   anon <on|off|status>                 cookie-less context, no logins, no profile
+ *   browser [url] [--headed]             start the throwaway browser (headless)
+ *   browser status | browser close | browser use <real|private>
  *   close [tab] [--mine|--all] | stop
  *   bench [--runs N] [--full] [--writes-only] [--json]   measure real latency
  *   mem                                                    daemon memory (heap after GC)
@@ -28,14 +40,25 @@
  *   --no-wait                open/goto: return without waiting for load
  *   --timeout <ms>           wait: give up after this (default 15000)
  *   --full                   screenshot: full page
+ *   --fast                   skip the human pacing (see the pacing section)
+ *   --headed                 browser: visible window instead of headless
+ *   --chrome <path>          browser: which Chrome/Chromium binary to launch
  *   --browser                cdp: send at browser level instead of the tab
  *   --port <cdpPort>         override the discovered CDP port
  */
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, openSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  openSync,
+  rmSync,
+  mkdtempSync,
+} from "node:fs";
 import { randomBytes } from "node:crypto";
-import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, dirname, delimiter } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import http from "node:http";
@@ -54,16 +77,23 @@ process.env.NO_PROXY = "localhost,127.0.0.1,::1";
 process.env.no_proxy = "localhost,127.0.0.1,::1";
 
 const SELF = fileURLToPath(import.meta.url);
-const STATE_DIR = join(homedir(), ".cache", "palmifer");
+const STATE_DIR = process.env.PALMIFER_STATE_DIR || join(homedir(), ".cache", "palmifer");
 const STATE_FILE = join(STATE_DIR, "state.json");
 const PID_FILE = join(STATE_DIR, "daemon.pid");
 const LOG_FILE = join(STATE_DIR, "daemon.log");
 const DAEMON_PORT = Number(process.env.PALMIFER_DAEMON_PORT || 8798);
-const INSPECT_HINT =
-  "Chrome remote debugging is not enabled (or was switched off).\n" +
-  "Open this in the browser you want to control and tick the box:\n" +
-  '  chrome://inspect/#remote-debugging -> "Allow remote debugging for this browser instance"\n' +
-  "Chrome will ask you to approve the connecting app once — click Allow.";
+// The hint has to match the mode: telling someone to click Allow in
+// chrome://inspect is useless when the browser at fault is our own headless one.
+function inspectHint() {
+  if (activeMode() === "private") {
+    return (
+      "the throwaway browser is not answering any more.\n" +
+      "Start it again with `palmifer browser`, or go back to your own browser with\n" +
+      "`palmifer browser use real`."
+    );
+  }
+  return REAL_HINT;
+}
 
 // The daemon drives a browser holding the user's sessions, so every request
 // carries a per-install token (0600) and the server refuses non-loopback hosts.
@@ -89,7 +119,18 @@ function ensureToken() {
 const argv = process.argv.slice(2);
 const args = {};
 const positional = [];
-const VALUED = new Set(["tab", "frame", "limit", "max", "port", "session", "filter", "timeout", "seconds"]);
+const VALUED = new Set([
+  "tab",
+  "frame",
+  "limit",
+  "max",
+  "port",
+  "session",
+  "filter",
+  "timeout",
+  "seconds",
+  "chrome",
+]);
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a.startsWith("--")) {
@@ -122,6 +163,99 @@ if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
   process.exit(0);
 }
 
+// ------------------------------------------------- which browser
+//
+// Two browsers are reachable: the one the user already runs (default, their
+// logins) and a throwaway instance palmifer starts itself (`palmifer browser`).
+// mode.json records which one the daemon should talk to, so the choice survives
+// daemon restarts instead of being an environment variable nobody remembers.
+
+const PRIVATE_FILE = join(STATE_DIR, "private.json");
+const MODE_FILE = join(STATE_DIR, "mode.json");
+
+function readJson(file) {
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+function writeJson(file, value) {
+  mkdirSync(STATE_DIR, { recursive: true });
+  writeFileSync(file, JSON.stringify(value));
+}
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+/** The throwaway browser we started — but only while its process is alive. */
+function privateBrowser() {
+  const p = readJson(PRIVATE_FILE);
+  return p && p.pid && p.endpoint && pidAlive(p.pid) ? p : null;
+}
+const activeMode = () => ((readJson(MODE_FILE) || {}).mode === "private" ? "private" : "real");
+const setMode = (mode) => writeJson(MODE_FILE, { mode });
+
+/**
+ * Tabs and @e refs belong to one browser; carrying them across a switch would
+ * aim the next command at a tab that does not exist there. The anonymous
+ * context id is kept on purpose: contexts are per-browser, so if the user
+ * switches away and back, `anonContext()` still finds it (and `anon off` can
+ * still close it) instead of leaving an orphan window behind.
+ */
+function forgetTabs() {
+  state.current = null;
+  state.refs = {};
+  state.refsTab = null;
+  saveState(state);
+}
+
+const REAL_HINT =
+  "Chrome remote debugging is not enabled (or was switched off).\n" +
+  "Open this in the browser you want to control and tick the box:\n" +
+  '  chrome://inspect/#remote-debugging -> "Allow remote debugging for this browser instance"\n' +
+  "Chrome will ask you to approve the connecting app once — click Allow.\n" +
+  "No browser to approve, or running unattended? `palmifer browser` starts a\n" +
+  "throwaway headless one that needs no opt-in.";
+
+function browserBinary() {
+  if (args.chrome) return String(args.chrome);
+  if (process.env.PALMIFER_CHROME) return process.env.PALMIFER_CHROME;
+  const mac = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+  ];
+  const win = [
+    join(process.env.PROGRAMFILES || "", "Google/Chrome/Application/chrome.exe"),
+    join(process.env["PROGRAMFILES(X86)"] || "", "Google/Chrome/Application/chrome.exe"),
+    join(process.env.LOCALAPPDATA || "", "Google/Chrome/Application/chrome.exe"),
+  ];
+  const onPath = [
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+    "microsoft-edge",
+    "microsoft-edge-stable",
+    "brave-browser",
+  ];
+  for (const p of mac) if (existsSync(p)) return p;
+  for (const p of win) if (p && existsSync(p)) return p;
+  for (const name of onPath) {
+    for (const dir of String(process.env.PATH || "").split(delimiter)) {
+      if (dir && existsSync(join(dir, name))) return join(dir, name);
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------- discovery
 
 function discoveryCandidates() {
@@ -142,6 +276,16 @@ function discoveryCandidates() {
   return [join(process.env.LOCALAPPDATA || "", "Google/Chrome/User Data/DevToolsActivePort")];
 }
 
+/** The user's own browser, found through the DevToolsActivePort it writes. */
+function realEndpoint() {
+  for (const f of discoveryCandidates()) {
+    if (!existsSync(f)) continue;
+    const [port, path] = readFileSync(f, "utf8").trim().split("\n");
+    if (port && path) return `ws://127.0.0.1:${port.trim()}${path.trim()}`;
+  }
+  return null;
+}
+
 function resolveEndpoint() {
   if (process.env.PALMIFER_ENDPOINT) return process.env.PALMIFER_ENDPOINT;
   if (args.port) {
@@ -153,12 +297,12 @@ function resolveEndpoint() {
     }
     return `ws://127.0.0.1:${args.port}`;
   }
-  for (const f of discoveryCandidates()) {
-    if (!existsSync(f)) continue;
-    const [port, path] = readFileSync(f, "utf8").trim().split("\n");
-    if (port && path) return `ws://127.0.0.1:${port.trim()}${path.trim()}`;
+  if (activeMode() === "private") {
+    const priv = privateBrowser();
+    if (priv) return priv.endpoint;
+    setMode("real"); // it is gone; fall back instead of failing confusingly
   }
-  return null;
+  return realEndpoint();
 }
 
 // ---------------------------------------------------------------- state
@@ -167,9 +311,10 @@ function loadState() {
   try {
     const s = JSON.parse(readFileSync(STATE_FILE, "utf8"));
     if (!Array.isArray(s.opened)) s.opened = [];
+    if (!s.anonContexts || typeof s.anonContexts !== "object") s.anonContexts = {};
     return s;
   } catch {
-    return { current: null, refs: {}, opened: [] };
+    return { current: null, refs: {}, opened: [], anonContexts: {} };
   }
 }
 function saveState(s) {
@@ -327,7 +472,7 @@ class Cdp {
   }
   send(method, params = {}, sessionId) {
     // A closed socket discards writes silently; say so instead of hanging.
-    if (this.closed) return Promise.reject(new Error(INSPECT_HINT));
+    if (this.closed) return Promise.reject(new Error(inspectHint()));
     return new Promise((resolve, reject) => {
       const id = ++this.id;
       const timer = setTimeout(() => {
@@ -340,20 +485,59 @@ class Cdp {
 }
 
 let conn = null;
+let connUrl = null;
+
+/** Drop the live connection so the next command re-resolves the endpoint. */
+function resetConn() {
+  if (conn) {
+    try {
+      conn.ws.close();
+    } catch {}
+  }
+  conn = null;
+  connUrl = null;
+}
 
 async function getConn() {
-  if (conn && !conn.closed) return conn;
   const url = resolveEndpoint();
-  if (!url) fail(INSPECT_HINT, 2);
+  // Keyed by URL, not merely "is there a connection": switching between the
+  // user's browser and the throwaway one must not silently keep the old socket.
+  if (conn && !conn.closed && connUrl === url) return conn;
+  if (conn && !conn.closed && connUrl !== url) resetConn();
+  if (!url) fail(inspectHint(), 2);
   const ws = new WebSocket(url);
   await new Promise((res, rej) => {
     ws.addEventListener("open", res, { once: true });
-    ws.addEventListener("error", () => rej(new Error(`cannot reach Chrome at ${url}\n${INSPECT_HINT}`)), { once: true });
-    const t = setTimeout(() => rej(new Error(INSPECT_HINT)), 120000);
+    ws.addEventListener("error", () => rej(new Error(`cannot reach the browser at ${url}\n${inspectHint()}`)), {
+      once: true,
+    });
+    const t = setTimeout(() => rej(new Error(inspectHint())), 120000);
     ws.addEventListener("open", () => clearTimeout(t), { once: true });
   });
   conn = new Cdp(ws);
+  connUrl = url;
   return conn;
+}
+
+/**
+ * The anonymous context in force for the *current* browser, if it still exists.
+ * Keyed per browser on purpose: a context created in the user's Chrome has no
+ * meaning in the throwaway one, and forgetting it on a switch would leave an
+ * orphan window nobody can close. Chrome also forgets contexts when it
+ * restarts, so a stale id is dropped rather than reused.
+ */
+async function anonContext(cdp) {
+  const map = (state.anonContexts = state.anonContexts || {});
+  const mode = activeMode();
+  const id = map[mode];
+  if (!id) return null;
+  try {
+    const { browserContextIds } = await cdp.send("Target.getBrowserContexts");
+    if ((browserContextIds || []).includes(id)) return id;
+  } catch {}
+  delete map[mode];
+  saveState(state);
+  return null;
 }
 
 async function pageTargets(cdp) {
@@ -576,17 +760,80 @@ const ACTIONABLE = new Set([
   "listbox", "option", "menuitem", "tab", "switch", "slider", "spinbutton",
 ]);
 
+// ---------------------------------------------------------------- keyboard
+//
+// `fill` sets a value; forms still need Enter, Tab or Escape. Keys go through
+// Input.dispatchKeyEvent so pages see trusted events, the same reason click
+// uses the real mouse path.
+
+const KEYS = {
+  Enter: { vk: 13, code: "Enter", text: "\r" },
+  Tab: { vk: 9, code: "Tab", text: "\t" },
+  Escape: { vk: 27, code: "Escape" },
+  Esc: { vk: 27, code: "Escape" },
+  Backspace: { vk: 8, code: "Backspace" },
+  Delete: { vk: 46, code: "Delete" },
+  Space: { vk: 32, code: "Space", text: " " },
+  ArrowUp: { vk: 38, code: "ArrowUp" },
+  ArrowDown: { vk: 40, code: "ArrowDown" },
+  ArrowLeft: { vk: 37, code: "ArrowLeft" },
+  ArrowRight: { vk: 39, code: "ArrowRight" },
+  Home: { vk: 36, code: "Home" },
+  End: { vk: 35, code: "End" },
+  PageUp: { vk: 33, code: "PageUp" },
+  PageDown: { vk: 34, code: "PageDown" },
+};
+
+// CDP modifier bits: Alt 1, Control 2, Meta 4, Shift 8.
+function keySpec(spec) {
+  const parts = String(spec).split("+");
+  const base = parts.pop();
+  const has = (...names) => names.some((n) => parts.includes(n));
+  const modifiers =
+    (has("Alt", "Option") ? 1 : 0) |
+    (has("Control", "Ctrl") ? 2 : 0) |
+    (has("Meta", "Cmd", "Command") ? 4 : 0) |
+    (has("Shift") ? 8 : 0);
+  let key = KEYS[base];
+  if (!key && /^[a-zA-Z0-9]$/.test(base)) {
+    key = {
+      vk: base.toUpperCase().charCodeAt(0),
+      code: /[a-zA-Z]/.test(base) ? `Key${base.toUpperCase()}` : `Digit${base}`,
+      text: base,
+    };
+  }
+  if (!key) fail(`unknown key "${spec}" — try Enter, Tab, Escape, ArrowDown, Meta+A`);
+  let text = key.text;
+  if (modifiers & (1 | 2 | 4)) text = undefined; // Ctrl+A selects, it must not type "a"
+  else if (text && modifiers & 8) text = text.toUpperCase();
+  const out = {
+    key: base === "Space" ? " " : base,
+    code: key.code,
+    windowsVirtualKeyCode: key.vk,
+    nativeVirtualKeyCode: key.vk,
+    modifiers,
+  };
+  if (text !== undefined) {
+    out.text = text;
+    out.unmodifiedText = key.text;
+  }
+  return out;
+}
+
 const commands = {
   async status() {
     const cdp = await getConn();
     const v = await cdp.send("Browser.getVersion");
     const pages = await pageTargets(cdp);
+    const anon = await anonContext(cdp);
     out({
       ok: true,
+      mode: activeMode(),
       endpoint: resolveEndpoint(),
       browser: v.product,
       protocol: v.protocolVersion,
       tabs: pages.length,
+      anonContext: anon,
       current: state.current,
       openedByMe: pruneOpened(pages).length,
       networkCapturing: !!net,
@@ -598,12 +845,14 @@ const commands = {
     const cdp = await getConn();
     const pages = await pageTargets(cdp);
     const mine = pruneOpened(pages);
+    const anon = await anonContext(cdp);
     out(
       pages.map((t, i) => ({
         i,
         id: t.targetId,
         current: t.targetId === state.current,
         mine: mine.includes(t.targetId),
+        anon: !!anon && t.browserContextId === anon,
         title: t.title.slice(0, 70),
         url: t.url.slice(0, 100),
       })),
@@ -634,14 +883,21 @@ const commands = {
   async open([url]) {
     if (!url) fail("usage: palmifer open <url>");
     const cdp = await getConn();
-    const { targetId } = await cdp.send("Target.createTarget", { url });
+    const anon = await anonContext(cdp);
+    const { targetId } = await cdp.send("Target.createTarget", {
+      url,
+      ...(anon ? { browserContextId: anon } : {}),
+    });
     state.current = targetId;
     state.refs = {};
     if (!state.opened.includes(targetId)) state.opened.push(targetId);
     saveState(state);
+    if (anon) {
+      console.log("· anonymous context: this tab starts with no cookies and no logins (`palmifer anon off` to stop)");
+    }
     noteHost(url);
     if (args["no-wait"]) {
-      out({ opened: targetId, url, waited: false });
+      out({ opened: targetId, url, waited: false, anon: !!anon });
       return;
     }
     let sessionId = await attach(cdp, targetId);
@@ -654,7 +910,7 @@ const commands = {
     const href = await evaluate(cdp, sessionId, "location.href").catch(() => url);
     await cdp.send("Target.detachFromTarget", { sessionId }).catch(() => {});
     await dwell(800, 1800);
-    out({ opened: targetId, title, url: href });
+    out({ opened: targetId, title, url: href, anon: !!anon });
   },
 
   async goto([url]) {
@@ -1059,6 +1315,280 @@ const commands = {
     fail("usage: palmifer network <start|stop|list|detail>");
   },
 
+  async press([key]) {
+    if (!key) fail("usage: palmifer press <key>   e.g. Enter, Tab, Escape, ArrowDown, Meta+A");
+    return withTab(async (cdp, sessionId) => {
+      await paceAction();
+      const spec = keySpec(key);
+      await cdp.send(
+        "Input.dispatchKeyEvent",
+        { type: spec.text === undefined ? "rawKeyDown" : "keyDown", ...spec },
+        sessionId,
+      );
+      if (isHuman()) await sleep(rand(25, 90));
+      await cdp.send(
+        "Input.dispatchKeyEvent",
+        {
+          type: "keyUp",
+          key: spec.key,
+          code: spec.code,
+          windowsVirtualKeyCode: spec.windowsVirtualKeyCode,
+          nativeVirtualKeyCode: spec.vk,
+          modifiers: spec.modifiers,
+        },
+        sessionId,
+      );
+      out({ pressed: key, human: isHuman() });
+    });
+  },
+
+  async anon([sub]) {
+    if (sub && !["on", "off", "status"].includes(sub)) fail("usage: palmifer anon <on|off|status>");
+    const cdp = await getConn();
+    const inContext = async (id) => {
+      const { targetInfos } = await cdp.send("Target.getTargets");
+      return targetInfos.filter((t) => t.type === "page" && t.browserContextId === id);
+    };
+
+    if (sub === "status") {
+      const live = await anonContext(cdp);
+      const tabs = live ? (await inContext(live)).length : 0;
+      out({
+        anon: live,
+        tabs,
+        note: live
+          ? "tabs opened now carry no cookies and no logins from your profile"
+          : "off — new tabs use the normal profile",
+      });
+      return;
+    }
+
+    if (sub === "off") {
+      const id = (state.anonContexts || {})[activeMode()];
+      if (!id) {
+        out({ anon: null, closedTabs: 0, note: "was not on" });
+        return;
+      }
+      const tabs = (await inContext(id)).filter(() => true);
+      const wasCurrent = tabs.some((t) => t.targetId === state.current);
+      for (const t of tabs) await cdp.send("Target.closeTarget", { targetId: t.targetId }).catch(() => {});
+      await cdp.send("Target.disposeBrowserContext", { browserContextId: id }).catch(() => {});
+      delete state.anonContexts[activeMode()];
+      if (wasCurrent) state.current = null;
+      state.opened = state.opened.filter((o) => !tabs.some((t) => t.targetId === o));
+      state.refs = {};
+      saveState(state);
+      out({ anon: null, closedTabs: tabs.length });
+      return;
+    }
+
+    const live = await anonContext(cdp);
+    if (live) {
+      out({ anon: live, note: "already on" });
+      return;
+    }
+    const { browserContextId } = await cdp.send("Target.createBrowserContext", { disposeOnDetach: false });
+    state.anonContexts = state.anonContexts || {};
+    state.anonContexts[activeMode()] = browserContextId;
+    state.refs = {};
+    saveState(state);
+    out({
+      anon: browserContextId,
+      note:
+        "on: every tab opened from now on gets a separate, empty cookie jar — no logins, " +
+        "no history. Chrome opens it in its own window; `palmifer anon off` closes those tabs and returns to normal.",
+    });
+  },
+
+  async browser([sub, arg]) {
+    const URLISH = !sub || /^(https?:|about:|file:|data:)/.test(sub);
+    const info = () => {
+      const p = privateBrowser();
+      return p
+        ? {
+            running: true,
+            pid: p.pid,
+            headless: p.headless,
+            endpoint: p.endpoint,
+            profileDir: p.profileDir,
+            startedAt: p.startedAt,
+          }
+        : { running: false };
+    };
+
+    if (sub === "status" || args.status) {
+      const p = privateBrowser();
+      if (!p && activeMode() === "private") setMode("real"); // it died; do not report a mode we cannot honour
+      // Never poke the user's browser just to answer a status question.
+      const tabs = p ? await getConn().then((c) => pageTargets(c)).then((t) => t.length).catch(() => null) : null;
+      out({
+        mode: activeMode(),
+        real: realEndpoint(),
+        private: info(),
+        tabs,
+        note: p
+          ? `use \`palmifer browser close\` to delete the throwaway profile (${p.profileDir})`
+          : "`palmifer browser` starts a throwaway browser; without it palmifer drives your own",
+      });
+      return;
+    }
+
+    if (sub === "use") {
+      const which = arg || "real";
+      if (!["real", "private"].includes(which)) fail("usage: palmifer browser use <real|private>");
+      if (which === "private" && !privateBrowser()) {
+        fail("no throwaway browser is running — start one with `palmifer browser`");
+      }
+      setMode(which);
+      resetConn();
+      forgetTabs();
+      out({ mode: which, endpoint: resolveEndpoint() });
+      return;
+    }
+
+    if (sub === "close" || args.stop) {
+      const p = readJson(PRIVATE_FILE);
+      let stopped = false;
+      if (p && p.pid && pidAlive(p.pid)) {
+        // detached, so the pid is the process-group leader: one signal reaps the
+        // whole browser, helper processes included.
+        try {
+          process.kill(-p.pid, "SIGTERM");
+        } catch {
+          try {
+            process.kill(p.pid, "SIGTERM");
+          } catch {}
+        }
+        for (let i = 0; i < 30 && pidAlive(p.pid); i++) await sleep(100);
+        if (pidAlive(p.pid)) {
+          try {
+            process.kill(-p.pid, "SIGKILL");
+          } catch {
+            try {
+              process.kill(p.pid, "SIGKILL");
+            } catch {}
+          }
+        }
+        stopped = true;
+      }
+      // Only ever delete a directory we created, and only one that looks like it.
+      let profileRemoved = false;
+      if (p && typeof p.profileDir === "string" && p.profileDir.includes("palmifer-private-")) {
+        try {
+          rmSync(p.profileDir, { recursive: true, force: true });
+          profileRemoved = !existsSync(p.profileDir);
+        } catch {}
+      }
+      rmSync(PRIVATE_FILE, { force: true });
+      setMode("real");
+      resetConn();
+      delete state.anonContexts.private; // it died with the process we just killed
+      forgetTabs();
+      out({ private: stopped ? "stopped" : "was not running", profileRemoved, mode: "real", endpoint: resolveEndpoint() });
+      return;
+    }
+
+    if (sub && !URLISH) fail(`usage: palmifer browser [url] [--headed] | browser <status|close|use>`);
+
+    const existing = privateBrowser();
+    if (existing && !args.restart) {
+      if (activeMode() !== "private") {
+        setMode("private");
+        resetConn();
+        forgetTabs();
+      }
+      if (sub) {
+        await commands.open([sub]);
+        return;
+      }
+      out({ private: "already running", ...info(), mode: "private" });
+      return;
+    }
+
+    const bin = browserBinary();
+    if (!bin) {
+      fail(
+        "no Chrome/Chromium found to launch.\n" +
+          "Install Chrome, or point at one: PALMIFER_CHROME=/path/to/chrome palmifer browser",
+      );
+    }
+    // A crashed run leaves a temp profile behind; drop it before making a new one.
+    const stale = readJson(PRIVATE_FILE);
+    if (stale && stale.profileDir && !pidAlive(stale.pid || 0) && String(stale.profileDir).includes("palmifer-private-")) {
+      try {
+        rmSync(stale.profileDir, { recursive: true, force: true });
+      } catch {}
+    }
+
+    const headless = !args.headed;
+    const profileDir = mkdtempSync(join(tmpdir(), "palmifer-private-"));
+    const portFile = join(profileDir, "DevToolsActivePort");
+    mkdirSync(STATE_DIR, { recursive: true });
+    const log = openSync(join(STATE_DIR, "private.log"), "a");
+    const child = spawn(
+      bin,
+      [
+        `--user-data-dir=${profileDir}`,
+        "--remote-debugging-port=0",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--no-service-autorun",
+        "--disable-sync",
+        "--disable-background-networking",
+        "--use-mock-keychain",
+        "--password-store=basic",
+        ...(headless ? ["--headless=new", "--disable-gpu"] : []),
+        sub && URLISH && sub !== "about:blank" ? sub : "about:blank",
+      ],
+      { detached: true, stdio: ["ignore", log, log] },
+    );
+    child.unref();
+
+    let endpoint = null;
+    for (let i = 0; i < 120; i++) {
+      if (existsSync(portFile)) {
+        const [port, path] = readFileSync(portFile, "utf8").trim().split("\n");
+        if (port && path) {
+          endpoint = `ws://127.0.0.1:${port.trim()}${path.trim()}`;
+          break;
+        }
+      }
+      if (child.exitCode !== null) break;
+      await sleep(100);
+    }
+    if (!endpoint) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+      rmSync(profileDir, { recursive: true, force: true });
+      fail("the throwaway browser never opened a CDP port — see ~/.cache/palmifer/private.log");
+    }
+
+    writeJson(PRIVATE_FILE, { pid: child.pid, endpoint, headless, profileDir, startedAt: Date.now() });
+    setMode("private");
+    resetConn();
+    forgetTabs();
+    await sleep(200);
+    const cdp = await getConn();
+    const pages = await pageTargets(cdp);
+    if (!pages.length) {
+      // Chrome can come up with no window at all; give it one rather than
+      // leaving every later command to fail with "no open tabs".
+      const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
+      state.current = targetId;
+      if (!state.opened.includes(targetId)) state.opened.push(targetId);
+      saveState(state);
+    }
+    out({
+      private: headless ? "running (headless)" : "running (windowed)",
+      pid: child.pid,
+      endpoint,
+      profileDir,
+      tabs: (await pageTargets(cdp)).length,
+      note: "this browser is brand new: no logins, no cookies. `palmifer browser close` stops it and deletes the profile.",
+    });
+  },
+
   async close([which]) {
     const cdp = await getConn();
     if (args.mine) {
@@ -1166,6 +1696,13 @@ if (cmd === "__serve") {
   });
   process.on("SIGTERM", () => process.exit(0));
 } else if (cmd === "stop") {
+  const stillUp = privateBrowser();
+  if (stillUp) {
+    console.error(
+      `· note: the throwaway browser (pid ${stillUp.pid}) is still running and its profile is at\n` +
+        `  ${stillUp.profileDir}\n  \`palmifer browser close\` stops it and deletes that profile.`,
+    );
+  }
   try {
     const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/stop`, {
       method: "POST",
@@ -1195,8 +1732,11 @@ if (cmd === "__serve") {
 
   if (!(await healthy())) {
     mkdirSync(STATE_DIR, { recursive: true });
+    // Only the user's own browser asks for permission; the throwaway one does not.
     console.error(
-      "· starting the local palmifer daemon — if Chrome asks “Allow remote debugging?”, click Allow once",
+      activeMode() === "private"
+        ? "· starting the local palmifer daemon"
+        : "· starting the local palmifer daemon — if Chrome asks “Allow remote debugging?”, click Allow once",
     );
     ensureToken();
     const log = openSync(LOG_FILE, "a");

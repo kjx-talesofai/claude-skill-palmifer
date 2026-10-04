@@ -31,7 +31,7 @@ shift || true
 
 positional=()
 flags='{}'
-VALUED=" tab frame limit max port session filter timeout seconds text "
+VALUED=" tab frame limit max port session filter timeout seconds chrome text "
 
 while [ $# -gt 0 ]; do
   case "$1" in
