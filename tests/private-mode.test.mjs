@@ -73,8 +73,8 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><title>palmife
   <div id="out">idle</div>
   <div id="lazy"></div>
   <div id="shadowhost"></div>
-  <div id="panel-a"><button id="dup-a">确认</button><span>inside panel a</span></div>
-  <div id="panel-b"><button id="dup-b">确认</button><span>inside panel b</span></div>
+  <div id="panel-a"><button id="dup-a" class="pickme">确认</button><span>inside panel a</span></div>
+  <div id="panel-b"><button id="dup-b" class="pickme">确认</button><span>inside panel b</span></div>
 </div>
 <div style="height:3000px"></div>
 `;
@@ -85,6 +85,8 @@ const FIXTURE_BODY = FIXTURE + `<script>
   document.getElementById('lbl').addEventListener('click', function(){document.getElementById('out').textContent='clicked-by-text';});
   document.getElementById('dup-a').addEventListener('click', function(){document.getElementById('out').textContent='clicked-panel-a';});
   document.getElementById('dup-b').addEventListener('click', function(){document.getElementById('out').textContent='clicked-panel-b';});
+  document.getElementById('dup-a').className='pickme';
+  document.getElementById('dup-b').className='pickme';
   var host=document.getElementById('shadowhost');
   var sr=host.attachShadow({mode:'open'});
   sr.innerHTML='<button id="in-shadow">开始试炼</button>';
@@ -276,6 +278,10 @@ try {
   check("click --text --within hits the right one", afterScopedClick.text.includes("clicked-panel-b"), `${scopedClick.text} → ${afterScopedClick.text}`);
   const badWithin = palmifer("dom", ".whatever", "--within", "#nope-not-here");
   check("--within that matches nothing says so", /matched nothing/.test(badWithin.text), badWithin.text);
+
+  const nthClick = palmifer("click", ".pickme", "--nth", "2");
+  const afterNth = palmifer("eval", "document.getElementById('out').textContent");
+  check("click <css> --nth picks the second match", afterNth.text.includes("clicked-panel-b"), `${nthClick.text} → ${afterNth.text}`);
 
   const front = palmifer("front");
   check("front raises the tab and reports it visible", front.json?.visibility === "visible", front.text);

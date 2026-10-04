@@ -50,7 +50,7 @@ profile. Say which one you used if the choice affects the user's account.
 | `open <url>` / `goto <url>` | new tab / navigate the current one |
 | `snapshot` | accessibility tree with `@eN` refs (`--actionable-only`, `--filter`, `--limit`) |
 | `text` | visible text of the page or a frame |
-| `click <@eN\|css>` / `click --text <label>` | interact; `--text` finds the control by what it says (shadow roots included) |
+| `click <@eN\|css>` / `click --text <label>` | interact; `--nth N` picks the Nth match (CSS or text), `--text` finds the control by what it says (shadow roots included) |
 | `fill <@eN\|css> <value>` | type into a field with real input events |
 | `press <Enter\|Tab\|Escape\|ArrowDown\|Meta+A>` | one real key event |
 | `scroll <down\|up\|bottom\|top>` | real wheel events (`--amount N`, `--times N`); bottom/top repeat until the page stops moving |
@@ -183,6 +183,9 @@ so a run can be resumed.
   unscoped `document.querySelector(".title")` happily returns a card the user
   cannot see. Scope the read: `dom ".title" --within ".note-detail-mask"`, or
   check `dom` for more matches than expected before trusting a value.
+- Lists that reshuffle between loads (search results) cannot be clicked by a title
+  captured earlier: click by position instead — `click "section.note-item" --nth 3`
+  — and read the item's own page for its real title.
 - Some sites render their search box collapsed, or as an icon with no label:
   `dom` reports it as `w:0,h:0` and `fill` refuses it (correctly). Use the site's
   own search URL with `goto` instead of fighting the hidden control.

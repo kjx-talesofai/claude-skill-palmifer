@@ -52,7 +52,7 @@
  *   --text <str>             wait/click/dom: match by visible text (pierces shadow roots)
  *   --js <expr>              wait: poll an expression until it is truthy
  *   --amount <px> --times N  scroll: how far, how often (bottom/top repeat until it stops)
- *   --nth <n>                click --text: which match to use (default 1)
+ *   --nth <n>                click: which match to use, for CSS and --text (default 1)
  *   --exact                  text matching must be the whole label
  *   --within <css>           dom/click --text: only look inside this container
  *   --allow-network          eval: silence the "this talks to the network" warning
@@ -784,10 +784,21 @@ async function elementRect(cdp, sessionId, sel) {
   if (!sel.startsWith("@e")) {
     // Resolve and measure in ONE call: SPA lists re-render between two calls and
     // a marker attribute would be wiped before the second round trip.
+    const nth = Math.max(1, Number(args.nth || 1));
     const res = await cdp.send(
       "Runtime.evaluate",
       {
-        expression: `(()=>{const el=document.querySelector(${JSON.stringify(sel)});if(!el)return null;el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height})})()`,
+        // --nth answers "the third card like this", which a CSS selector alone
+        // cannot express and which hand-built nth-of-type chains get wrong on
+        // real pages. Falls back to the shadow-piercing walker.
+        expression: `(()=>{${DEEP_JS}
+          let el=null;
+          try{ el=document.querySelectorAll(${JSON.stringify(sel)})[${nth - 1}]||null }catch(e){}
+          if(!el){ const hits=__palmRank(__palmMatch(${JSON.stringify(sel)},false,null)); el=hits.length?hits[0].el:null }
+          if(!el){ const sc=__palmScope(${JSON.stringify(sel)}); el=sc }
+          if(!el)return null;
+          el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();
+          return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height})})()`,
         returnByValue: true,
       },
       sessionId,
@@ -795,7 +806,7 @@ async function elementRect(cdp, sessionId, sel) {
     if (res.exceptionDetails) {
       fail(`selector threw: ${res.exceptionDetails.exception?.description || res.exceptionDetails.text}`);
     }
-    if (!res.result.value) fail(`selector not found: ${sel}`);
+    if (!res.result.value) fail(`selector not found: ${sel}${Number(args.nth || 1) > 1 ? ` (#${args.nth})` : ""}`);
     const rect = JSON.parse(res.result.value);
     // A zero-size box means we matched a hidden helper element; clicking (0,0)
     // would silently hit whatever sits in the corner.
@@ -1337,7 +1348,7 @@ const commands = {
   },
 
   async click([sel]) {
-    if (!sel && !args.text) fail("usage: palmifer click <selector|@eN> | click --text <label> [--nth N]");
+    if (!sel && !args.text) fail("usage: palmifer click <selector|@eN> [--nth N] | click --text <label> [--nth N]");
     if (args.frame) fail("--frame is supported by snapshot/text/eval/wait; click acts on the top document");
     return withTab(async (cdp, sessionId, target) => {
       await paceAction();
@@ -1364,12 +1375,14 @@ const commands = {
       if (sel.startsWith("@e") && state.refsTab && state.refsTab !== target.targetId) {
         fail("@e refs were captured on another tab — run snapshot on this tab");
       }
-      if (args.trusted || isHuman()) {
+      if (args.trusted || isHuman() || args.nth || args.within) {
         // Real input events: pages that check event.isTrusted ignore el.click(),
         // and an eased pointer path is what the user's own hand looks like.
+        // --nth/--within are positional, so they always resolve to a point.
         const rect = await trustedClick(cdp, sessionId, sel);
         out({
           clicked: sel,
+          nth: Math.max(1, Number(args.nth || 1)),
           trusted: true,
           human: isHuman(),
           at: { x: Math.round(rect.x), y: Math.round(rect.y) },
