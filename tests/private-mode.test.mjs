@@ -69,7 +69,7 @@ function palmiferRaw(...args) {
 const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><title>palmifer fixture</title></head><body>
 <h1>cookie probe</h1>
 <div id="tools">
-  <button id="lbl">下一页</button>
+  <button id="lbl" data-testid="next-page" aria-label="下一页按钮">下一页</button>
   <div id="out">idle</div>
   <div id="lazy"></div>
   <div id="shadowhost"></div>
@@ -282,6 +282,10 @@ try {
   const nthClick = palmifer("click", ".pickme", "--nth", "2");
   const afterNth = palmifer("eval", "document.getElementById('out').textContent");
   check("click <css> --nth picks the second match", afterNth.text.includes("clicked-panel-b"), `${nthClick.text} → ${afterNth.text}`);
+
+  const attrs = palmifer("dom", "#tools button", "--limit", "3");
+  const firstRow = Array.isArray(attrs.json) ? attrs.json[0] : null;
+  check("dom rows carry attributes (id/data-testid/aria-label)", !!firstRow?.attrs && (firstRow.attrs.id === "lbl" || firstRow.attrs["data-testid"]), JSON.stringify(firstRow));
 
   const front = palmifer("front");
   check("front raises the tab and reports it visible", front.json?.visibility === "visible", front.text);

@@ -26,7 +26,8 @@
  *   front                                raise this tab (input only reaches a visible tab)
  *   scroll <down|up|bottom|top>          real wheel events ([--amount N] [--times N])
  *   dom <css> | dom --text <str>         structural probe; pierces shadow roots
- *                                        (--text keeps the innermost matches; --all for ancestors)
+ *                                        (--text keeps the innermost matches; --all for ancestors;
+ *                                        rows carry id/data-testid/aria-label/href/role)
  *   click --text <str> [--nth N]         click a control by its label, no selector
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   anon <on|off|status>                 cookie-less context, no logins, no profile
@@ -902,6 +903,8 @@ const DEEP_JS = `
          hits.push({el,tag:el.tagName?el.tagName.toLowerCase():"",cls:(typeof el.className==="string"?el.className:"").slice(0,60),
            text:own.slice(0,90),x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height,interactive:__palmInteractive(el)}) } } }
    return hits }
+ function __palmAttrs(el){ const o={}; for(const a of ["id","data-testid","aria-label","href","role","title","name","type","alt","placeholder"]){
+   try{ const v=el.getAttribute&&el.getAttribute(a); if(v) o[a]=String(v).slice(0,60) }catch(e){} } return o }
  function __palmDeepest(hits){ return hits.filter(h=>!hits.some(o=>o!==h&&h.el.contains(o.el))) }
  function __palmRank(hits){ const vis=hits.filter(h=>h.w>=2&&h.h>=2);
    // the innermost clickable thing wins: prefer real controls, then the smallest box
@@ -945,13 +948,14 @@ async function deepQuery(cdp, sessionId, { selector = null, text = null, exact =
       for(const root of __palmRoots(scope)){ let els; try{els=root.querySelectorAll(${JSON.stringify(selector || "")})}catch(e){return JSON.stringify([{error:String(e.message||e)}])}
         for(const el of els){ const r=el.getBoundingClientRect();
           rows.push({tag:el.tagName?el.tagName.toLowerCase():"",cls:(typeof el.className==="string"?el.className:"").slice(0,50),
+            attrs:__palmAttrs(el),
             text:__palmText(el).slice(0,90),interactive:__palmInteractive(el),shadow:root!==document,
             x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height)}) } }
     } else {
       let hits=__palmMatch(${JSON.stringify(String(text || ""))},${exact ? "true" : "false"},scope);
       if(${all ? "false" : "true"}) hits=__palmDeepest(hits);
       for(const h of __palmRank(hits)){
-        rows.push({tag:h.tag,cls:h.cls,text:h.text,interactive:h.interactive,shadow:!!h.el.getRootNode().host,
+        rows.push({tag:h.tag,cls:h.cls,attrs:__palmAttrs(h.el),text:h.text,interactive:h.interactive,shadow:!!h.el.getRootNode().host,
           x:Math.round(h.x),y:Math.round(h.y),w:Math.round(h.w),h:Math.round(h.h)}) } }
     return JSON.stringify(rows.slice(0,${Number(limit) || 20}))})()`;
   const raw = await evaluate(cdp, sessionId, expr);
