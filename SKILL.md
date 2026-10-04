@@ -66,6 +66,7 @@ profile. Say which one you used if the choice affects the user's account.
 | `browser [url] [--headed] [--profile-dir <dir>] [--dry-run]` | the browser palmifer starts itself |
 | `browser status\|close\|use <real\|private>` | its lifecycle, and which one is active |
 | `close [tab] [--mine\|--all]` | close tabs (refuses to close the last one unless `--force`) |
+| `cancel` | stop the command the daemon is running, without dropping the Chrome approval |
 | `stop` | stop the local daemon |
 | `bench [--runs N] [--json] [--cold]` | measure real latency; read-only |
 | `mem` | daemon memory (heap after a forced GC) |
@@ -170,6 +171,11 @@ so a run can be resumed.
   execution context.
 - `target="_blank"` links can be popup-blocked: read the `href`, then `open` it.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
+- No command hangs forever. Each one gets a budget (20 s for cheap calls, 60 s for
+  navigation/scroll, `wait` = its `--timeout` + 5 s); when it runs out the error
+  names the command and what to check. `PALMIFER_CMD_BUDGET_MS` changes it.
+  A command stuck mid-flight is stopped with `palmifer cancel` — which keeps the
+  daemon, so the Chrome approval is not lost.
 - Chrome only feeds input to the tab it is showing: `scroll`/`click`/`fill`/`press`
   refuse a hidden tab instead of hanging 60 s. Run `palmifer front`, or pass
   `--front` so the command raises the tab itself. Long unattended runs need

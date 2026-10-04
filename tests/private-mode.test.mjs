@@ -58,6 +58,16 @@ function palmifer(...args) {
   return { code: r.status, text, json };
 }
 
+/** Like palmifer(), with extra environment for this call only. */
+function palmiferWithEnv(extraEnv, ...args) {
+  const r = spawnSync(process.execPath, [CLI, ...args], { env: { ...ENV, ...extraEnv }, encoding: "utf8", timeout: 120000 });
+  const text = `${r.stdout || ""}${r.stderr || ""}`.trim();
+  const line = text.split("\n").find((l) => /^[[{]/.test(l.trim()));
+  let json = null;
+  if (line) { try { json = JSON.parse(line); } catch {} }
+  return { code: r.status, text, json };
+}
+
 function palmiferRaw(...args) {
   const r = spawnSync(process.execPath, [CLI, ...args], { env: ENV, encoding: "utf8", timeout: 120000 });
   return `${r.stdout || ""}${r.stderr || ""}`.trim();
@@ -286,6 +296,25 @@ try {
   const attrs = palmifer("dom", "#tools button", "--limit", "3");
   const firstRow = Array.isArray(attrs.json) ? attrs.json[0] : null;
   check("dom rows carry attributes (id/data-testid/aria-label)", !!firstRow?.attrs && (firstRow.attrs.id === "lbl" || firstRow.attrs["data-testid"]), JSON.stringify(firstRow));
+
+  const starved = palmiferWithEnv({ PALMIFER_CMD_BUDGET_MS: "700" }, "wait", "--js", "false", "--timeout", "8000");
+  check("a command that runs past its budget says which command and what to check",
+    starved.code !== 0 && /out of its \d+s budget/.test(starved.text) && /palmifer wait/.test(starved.text) && /--front/.test(starved.text),
+    starved.text.slice(0, 200));
+
+  // cancel: start a long wait, then stop it from another process
+  const longWait = spawn(process.execPath, [CLI, "wait", "--js", "false", "--timeout", "25000"], { env: ENV });
+  let waitedErr = "";
+  longWait.stderr.on("data", (d) => { waitedErr += d.toString(); });
+  const waitDone = new Promise((r) => longWait.on("exit", (code) => r(code)));
+  await new Promise((r) => setTimeout(r, 1200));
+  const cancelled = palmifer("cancel");
+  check("cancel names the command it stopped", cancelled.json?.cancelling === "wait", JSON.stringify(cancelled.json));
+  const code = await Promise.race([waitDone, new Promise((r) => setTimeout(() => r("timeout"), 8000))]);
+  check("the running command actually stopped", code !== "timeout" && code !== 0, `exit=${code}`);
+  check("...and said why", /cancelled by/.test(waitedErr), waitedErr.slice(0, 160));
+  const after = palmifer("status");
+  check("the daemon survives a cancel", after.json?.ok === true, after.text);
 
   const front = palmifer("front");
   check("front raises the tab and reports it visible", front.json?.visibility === "visible", front.text);

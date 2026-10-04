@@ -25,7 +25,7 @@ cmd="${1:-}"
 
 # Commands only the Node CLI implements — they do not talk to the daemon.
 case "$cmd" in
-  stop|bench|help|version|--help|-h|--version) exec node "$node_cli" "${orig[@]}" ;;
+  stop|cancel|bench|help|version|--help|-h|--version) exec node "$node_cli" "${orig[@]}" ;;
 esac
 shift || true
 

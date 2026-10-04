@@ -36,6 +36,7 @@
  *                                        in across restarts (this is the server mode)
  *   browser --dry-run                    print the Chrome command line, launch nothing
  *   browser status | browser close | browser use <real|private>
+ *   cancel                               stop the command the daemon is running
  *   close [tab] [--mine|--all] | stop
  *   bench [--runs N] [--full] [--writes-only] [--json]   measure real latency
  *   mem                                                    daemon memory (heap after GC)
@@ -73,6 +74,8 @@
  *   PALMIFER_ACTION_CAP      burst cap per 10 min (default 80)
  *   PALMIFER_DAEMON_PORT     default 8798
  *   PALMIFER_STATE_DIR       default ~/.cache/palmifer
+ *   PALMIFER_CMD_BUDGET_MS   per-command timeout before a CDP call is declared stuck
+ *                            (defaults: 20s cheap, 60s slow, wait uses --timeout+5s)
  */
 
 import {
@@ -558,11 +561,18 @@ class Cdp {
   send(method, params = {}, sessionId) {
     // A closed socket discards writes silently; say so instead of hanging.
     if (this.closed) return Promise.reject(new Error(inspectHint()));
+    // `palmifer cancel` is cooperative: it stops the next call rather than
+    // killing the daemon (which would also throw away the Chrome approval).
+    if (cancelRequested) return Promise.reject(new Error("cancelled by `palmifer cancel`"));
     return new Promise((resolve, reject) => {
       const id = ++this.id;
+      const left = commandBudgetLeft();
+      if (left <= 0) {
+        return reject(budgetError(method));
+      }
       const timer = setTimeout(() => {
-        if (this.pending.delete(id)) reject(new Error(`${method} timed out`));
-      }, 60000);
+        if (this.pending.delete(id)) reject(budgetError(method));
+      }, left);
       this.pending.set(id, { resolve, reject, timer });
       this.ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
     });
@@ -571,6 +581,33 @@ class Cdp {
 
 let conn = null;
 let connUrl = null;
+let runningCommand = null; // what the daemon is executing right now
+let cancelRequested = false;
+
+/** Long commands get a longer leash; the default is deliberately short so a
+ *  stuck call is reported while the user is still watching. */
+function budgetFor(name, requestedByClient = 0) {
+  // The daemon is long-lived: its own environment was captured at start-up, so
+  // a budget the user exports later only works if the client sends it along.
+  const override = Number(requestedByClient || process.env.PALMIFER_CMD_BUDGET_MS || 0);
+  if (override > 0) return override;
+  if (name === "wait") return Number(args.timeout || 15000) + 5000;
+  if (["scroll", "open", "goto", "browser", "bench", "upload", "screenshot", "pdf"].includes(name)) return 60000;
+  return 20000;
+}
+function commandBudgetLeft() {
+  const left = commandDeadline ? commandDeadline - Date.now() : 20000;
+  return Math.min(60000, left); // <= 0 means the command is out of time
+}
+function budgetError(method) {
+  const spent = commandDeadline ? (budgetFor(runningCommand || "") - Math.max(0, commandDeadline - Date.now())) : 0;
+  return new Error(
+    `${method} gave up: \`palmifer ${runningCommand || "?"}\` ran out of its ${Math.max(0, Math.round(spent / 1000))}s budget.\n` +
+      "  What to check: is the tab hidden (pass --front)? is the page busy or mid-navigation?\n" +
+      "  A longer leash: --timeout for wait, PALMIFER_CMD_BUDGET_MS for everything.",
+  );
+}
+let commandDeadline = null;
 
 /** Can we actually open a WebSocket to this endpoint right now? */
 async function canConnect(url, timeoutMs = 1500) {
@@ -1268,6 +1305,7 @@ const commands = {
           ? `(()=>{${DEEP_JS} return __palmRoots().some(r=>__palmText(r.host||r).includes(${JSON.stringify(wantText)})||((r.body||r).innerText||"").includes(${JSON.stringify(wantText)}))})()`
           : `(()=>{${DEEP_JS} for(const r of __palmRoots()){ try{ if((r.body||r).querySelector(${JSON.stringify(target)})) return true }catch(e){} } return false})()`;
       while (Date.now() < deadline) {
+        throwIfStopped();
         const ok = await evaluate(cdp, sessionId, expr, ctx ? ctx.contextId : undefined).catch(() => false);
         if (ok) {
           out({ ok: true, waitedMs: timeout - (deadline - Date.now()) });
@@ -1324,6 +1362,7 @@ const commands = {
       let steps = 0;
       let last = y0;
       for (let i = 0; i < maxSteps; i++) {
+        throwIfStopped();
         // A wheel event is what a trackpad sends, so every scroll listener,
         // lazy loader and infinite-scroll hook on the page sees a real gesture.
         await cdp.send(
@@ -2032,13 +2071,32 @@ function json(res, body, code = 200) {
   res.end(s);
 }
 
-async function runLocal(name, positional, localArgs) {
+/**
+ * Polling loops swallow CDP errors on purpose (a page that is not ready yet is
+ * normal). Two conditions are not normal and must never be swallowed: the user
+ * cancelled, and the command ran out of time. Both are checked at the top of
+ * every loop iteration, outside the `catch`.
+ */
+function throwIfStopped() {
+  if (cancelRequested) fail("cancelled by `palmifer cancel`");
+  if (commandDeadline && Date.now() > commandDeadline) fail(budgetError("(polling)").message);
+}
+
+async function runLocal(name, positional, localArgs, requestedBudget = 0) {
   // Rebind per request: a flag from the previous call must never leak forward.
   for (const k of Object.keys(args)) delete args[k];
   Object.assign(args, localArgs || {});
   const fn = commands[name];
   if (!fn) throw new Error(`unknown command: ${name}`);
-  return fn(positional);
+  runningCommand = name;
+  cancelRequested = false; // a stale cancel must not kill the next command
+  commandDeadline = Date.now() + budgetFor(name, requestedBudget);
+  try {
+    return await fn(positional);
+  } finally {
+    runningCommand = null;
+    commandDeadline = null;
+  }
 }
 
 if (cmd === "__serve") {
@@ -2052,6 +2110,12 @@ if (cmd === "__serve") {
     }
     if (req.url === "/health") return json(res, { ok: true, pid: process.pid });
     if (req.headers["x-palmifer-token"] !== token) return json(res, { error: "bad token" }, 401);
+    if (req.url === "/cancel") {
+      if (req.method !== "POST") return json(res, { error: "cancel requires POST" }, 405);
+      if (!runningCommand) return json(res, { ok: true, note: "nothing is running" });
+      cancelRequested = true;
+      return json(res, { ok: true, cancelling: runningCommand });
+    }
     if (req.url === "/stop") {
       if (req.method !== "POST") return json(res, { error: "stop requires POST" }, 405);
       json(res, { ok: true });
@@ -2079,7 +2143,7 @@ if (cmd === "__serve") {
       console.error = (...a) => buf.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" "));
       let error = null;
       try {
-        await runLocal(body.cmd, body.positional || [], body.args || {});
+        await runLocal(body.cmd, body.positional || [], body.args || {}, Number(body.budget || 0));
       } catch (e) {
         error = String(e.message || e);
       } finally {
@@ -2107,6 +2171,17 @@ if (cmd === "__serve") {
   }
   try {
     const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/stop`, {
+      method: "POST",
+      headers: { "x-palmifer-token": daemonToken() },
+      signal: AbortSignal.timeout(5000),
+    });
+    out(await r.json());
+  } catch {
+    out({ ok: true, note: "daemon was not running" });
+  }
+} else if (cmd === "cancel") {
+  try {
+    const r = await fetch(`http://127.0.0.1:${DAEMON_PORT}/cancel`, {
       method: "POST",
       headers: { "x-palmifer-token": daemonToken() },
       signal: AbortSignal.timeout(5000),
@@ -2166,7 +2241,12 @@ if (cmd === "__serve") {
     const res = await fetch(`http://127.0.0.1:${DAEMON_PORT}/run`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-palmifer-token": daemonToken() },
-      body: JSON.stringify({ cmd, positional: rest, args }),
+      body: JSON.stringify({
+        cmd,
+        positional: rest,
+        args,
+        budget: Number(process.env.PALMIFER_CMD_BUDGET_MS || 0) || undefined,
+      }),
       signal: AbortSignal.timeout(180000),
     });
     if (!res.ok) {
