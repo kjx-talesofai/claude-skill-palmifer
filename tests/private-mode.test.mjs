@@ -73,6 +73,8 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><title>palmife
   <div id="out">idle</div>
   <div id="lazy"></div>
   <div id="shadowhost"></div>
+  <div id="panel-a"><button id="dup-a">确认</button><span>inside panel a</span></div>
+  <div id="panel-b"><button id="dup-b">确认</button><span>inside panel b</span></div>
 </div>
 <div style="height:3000px"></div>
 `;
@@ -81,6 +83,8 @@ const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><title>palmife
 const FIXTURE_BODY = FIXTURE + `<script>
   setTimeout(function(){document.getElementById('lazy').textContent='appeared';}, 1000);
   document.getElementById('lbl').addEventListener('click', function(){document.getElementById('out').textContent='clicked-by-text';});
+  document.getElementById('dup-a').addEventListener('click', function(){document.getElementById('out').textContent='clicked-panel-a';});
+  document.getElementById('dup-b').addEventListener('click', function(){document.getElementById('out').textContent='clicked-panel-b';});
   var host=document.getElementById('shadowhost');
   var sr=host.attachShadow({mode:'open'});
   sr.innerHTML='<button id="in-shadow">开始试炼</button>';
@@ -261,6 +265,18 @@ try {
   const priv = JSON.parse(readFileSync(join(STATE_DIR, "private.json"), "utf8"));
   const withFront = palmifer("scroll", "down", "--amount", "200", "--front");
   check("--front is accepted on input commands", (withFront.json?.moved || 0) > 0, withFront.text);
+  const scopedDom = palmifer("dom", "--text", "确认", "--within", "#panel-b");
+  check("--within scopes the search to one container", Array.isArray(scopedDom.json) && scopedDom.json.length === 1 && scopedDom.json[0].text.includes("确认"), scopedDom.text);
+  const unscoped = palmifer("dom", "--text", "确认");
+  check("--text keeps only the innermost matches (no ancestor noise)", Array.isArray(unscoped.json) && unscoped.json.length === 2, unscoped.text);
+  const withAncestors = palmifer("dom", "--text", "确认", "--all");
+  check("--all brings the ancestors back", Array.isArray(withAncestors.json) && withAncestors.json.length > 2, withAncestors.text);
+  const scopedClick = palmifer("click", "--text", "确认", "--within", "#panel-b");
+  const afterScopedClick = palmifer("eval", "document.getElementById('out').textContent");
+  check("click --text --within hits the right one", afterScopedClick.text.includes("clicked-panel-b"), `${scopedClick.text} → ${afterScopedClick.text}`);
+  const badWithin = palmifer("dom", ".whatever", "--within", "#nope-not-here");
+  check("--within that matches nothing says so", /matched nothing/.test(badWithin.text), badWithin.text);
+
   const front = palmifer("front");
   check("front raises the tab and reports it visible", front.json?.visibility === "visible", front.text);
   const lastTab = palmifer("close", "--all");

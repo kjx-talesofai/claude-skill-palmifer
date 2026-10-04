@@ -26,6 +26,7 @@
  *   front                                raise this tab (input only reaches a visible tab)
  *   scroll <down|up|bottom|top>          real wheel events ([--amount N] [--times N])
  *   dom <css> | dom --text <str>         structural probe; pierces shadow roots
+ *                                        (--text keeps the innermost matches; --all for ancestors)
  *   click --text <str> [--nth N]         click a control by its label, no selector
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   anon <on|off|status>                 cookie-less context, no logins, no profile
@@ -53,6 +54,7 @@
  *   --amount <px> --times N  scroll: how far, how often (bottom/top repeat until it stops)
  *   --nth <n>                click --text: which match to use (default 1)
  *   --exact                  text matching must be the whole label
+ *   --within <css>           dom/click --text: only look inside this container
  *   --allow-network          eval: silence the "this talks to the network" warning
  *   --front                  scroll/click/fill/press: raise the tab if it is hidden
  *   --headed                 browser: visible window instead of headless
@@ -166,6 +168,7 @@ const VALUED = new Set([
   "times",
   "nth",
   "js",
+  "within",
 ]);
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -868,7 +871,12 @@ const ACTIONABLE = new Set([
 // shadow roots too, because "read the page" has to mean the page the user sees.
 
 const DEEP_JS = `
- function __palmRoots(){ const roots=[document]; const seen=new Set(roots);
+ function __palmScope(sel){ for(const r of __palmAll()){ try{ const el=(r.body||r).querySelector(sel); if(el) return el }catch(e){} } return null }
+ function __palmAll(){ const roots=[document]; const seen=new Set(roots);
+   for(let i=0;i<roots.length;i++){ let els; try{els=roots[i].querySelectorAll("*")}catch(e){continue}
+     for(const el of els){ if(el.shadowRoot&&!seen.has(el.shadowRoot)){ seen.add(el.shadowRoot); roots.push(el.shadowRoot) } } }
+   return roots }
+ function __palmRoots(scope){ const roots=[scope||document]; const seen=new Set(roots);
    for(let i=0;i<roots.length;i++){ let els; try{els=roots[i].querySelectorAll("*")}catch(e){continue}
      for(const el of els){ if(el.shadowRoot&&!seen.has(el.shadowRoot)){ seen.add(el.shadowRoot); roots.push(el.shadowRoot) } } }
    return roots }
@@ -876,17 +884,18 @@ const DEEP_JS = `
  function __palmInteractive(el){ const t=el.tagName?el.tagName.toLowerCase():"";
    return !!(t==="button"||t==="a"||t==="input"||t==="label"||t==="option"||t==="select"||el.getAttribute("role")==="button"
      || (el.onclick!==undefined&&el.onclick!==null) || (function(){try{return getComputedStyle(el).cursor==="pointer"}catch(e){return false}})()) }
- function __palmMatch(want,exact){ const hits=[];
-   for(const root of __palmRoots()){ let els; try{els=root.querySelectorAll("*")}catch(e){continue}
+ function __palmMatch(want,exact,scope){ const hits=[];
+   for(const root of __palmRoots(scope)){ let els; try{els=root.querySelectorAll("*")}catch(e){continue}
      for(const el of els){ const own=__palmText(el); if(!own)continue;
        if(exact?own===want:own.includes(want)){ const r=el.getBoundingClientRect();
          hits.push({el,tag:el.tagName?el.tagName.toLowerCase():"",cls:(typeof el.className==="string"?el.className:"").slice(0,60),
            text:own.slice(0,90),x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height,interactive:__palmInteractive(el)}) } } }
    return hits }
+ function __palmDeepest(hits){ return hits.filter(h=>!hits.some(o=>o!==h&&h.el.contains(o.el))) }
  function __palmRank(hits){ const vis=hits.filter(h=>h.w>=2&&h.h>=2);
    // the innermost clickable thing wins: prefer real controls, then the smallest box
    return vis.sort((a,b)=>(b.interactive-a.interactive)||(a.w*a.h-b.w*b.h)) }
- function __palmPick(want,exact,nth){ const ranked=__palmRank(__palmMatch(want,exact));
+ function __palmPick(want,exact,nth,scope){ const ranked=__palmRank(__palmMatch(want,exact,scope));
    const pick=ranked[nth-1]; if(!pick) return null;
    pick.el.scrollIntoView({block:"center",inline:"center"});
    const r=pick.el.getBoundingClientRect();
@@ -895,9 +904,11 @@ const DEEP_JS = `
 `;
 
 /** Click target found by its visible text, through shadow roots. */
-async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false } = {}) {
+async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false, within = null } = {}) {
   const expr = `(()=>{${DEEP_JS}
-    const p=__palmPick(${JSON.stringify(String(want))},${exact ? "true" : "false"},${Number(nth) || 1});
+    const scope=${within ? `__palmScope(${JSON.stringify(String(within))})` : "null"};
+    if(${within ? "true" : "false"} && !scope) return JSON.stringify({error:"--within matched nothing"});
+    const p=__palmPick(${JSON.stringify(String(want))},${exact ? "true" : "false"},${Number(nth) || 1},scope);
     if(!p) return null;
     return JSON.stringify(p)})()`;
   const raw = await evaluate(cdp, sessionId, expr);
@@ -908,22 +919,27 @@ async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false 
     );
   }
   const rect = JSON.parse(raw);
+  if (rect.error) fail(`${rect.error} — check the container selector with \`palmifer dom <sel>\``);
   if (rect.w < 2 || rect.h < 2) fail(`text "${want}" matched a zero-size element: ${rect.tag}.${rect.cls}`);
   return rect;
 }
 
 /** Elements matching a CSS selector or text, shadow roots included. */
-async function deepQuery(cdp, sessionId, { selector = null, text = null, exact = false, limit = 20 }) {
+async function deepQuery(cdp, sessionId, { selector = null, text = null, exact = false, limit = 20, within = null, all = false }) {
   const expr = `(()=>{${DEEP_JS}
     const rows=[];
+    const scope=${within ? `__palmScope(${JSON.stringify(String(within))})` : "null"};
+    if(${within ? "true" : "false"} && !scope) return JSON.stringify([{error:"--within matched nothing: "+${JSON.stringify(String(within || ""))}}]);
     if(${selector ? "true" : "false"}){
-      for(const root of __palmRoots()){ let els; try{els=root.querySelectorAll(${JSON.stringify(selector || "")})}catch(e){return JSON.stringify([{error:String(e.message||e)}])}
+      for(const root of __palmRoots(scope)){ let els; try{els=root.querySelectorAll(${JSON.stringify(selector || "")})}catch(e){return JSON.stringify([{error:String(e.message||e)}])}
         for(const el of els){ const r=el.getBoundingClientRect();
           rows.push({tag:el.tagName?el.tagName.toLowerCase():"",cls:(typeof el.className==="string"?el.className:"").slice(0,50),
             text:__palmText(el).slice(0,90),interactive:__palmInteractive(el),shadow:root!==document,
             x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height)}) } }
     } else {
-      for(const h of __palmRank(__palmMatch(${JSON.stringify(String(text || ""))},${exact ? "true" : "false"}))){
+      let hits=__palmMatch(${JSON.stringify(String(text || ""))},${exact ? "true" : "false"},scope);
+      if(${all ? "false" : "true"}) hits=__palmDeepest(hits);
+      for(const h of __palmRank(hits)){
         rows.push({tag:h.tag,cls:h.cls,text:h.text,interactive:h.interactive,shadow:!!h.el.getRootNode().host,
           x:Math.round(h.x),y:Math.round(h.y),w:Math.round(h.w),h:Math.round(h.h)}) } }
     return JSON.stringify(rows.slice(0,${Number(limit) || 20}))})()`;
@@ -1269,6 +1285,8 @@ const commands = {
         text,
         exact: !!args.exact,
         limit: Number(args.limit || 20),
+        within: args.within ? String(args.within) : null,
+        all: !!args.all,
       });
       if (rows.length && rows[0].error) fail(`selector threw: ${rows[0].error}`);
       out(rows.length ? rows : { matched: 0, note: `nothing matched ${text ? `text "${text}"` : selector} (shadow roots included)` });
@@ -1330,6 +1348,7 @@ const commands = {
         const rect = await elementRectByText(cdp, sessionId, String(args.text), {
           nth: Number(args.nth || 1),
           exact: !!args.exact,
+          within: args.within ? String(args.within) : null,
         });
         await trustedClickAt(cdp, sessionId, rect);
         out({

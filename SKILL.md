@@ -55,7 +55,7 @@ profile. Say which one you used if the choice affects the user's account.
 | `press <Enter\|Tab\|Escape\|ArrowDown\|Meta+A>` | one real key event |
 | `scroll <down\|up\|bottom\|top>` | real wheel events (`--amount N`, `--times N`); bottom/top repeat until the page stops moving |
 | `front` | raise this tab — input only reaches a visible tab |
-| `dom <css>` / `dom --text <str>` | structural probe; lists matches with tag/text/rect, piercing shadow roots |
+| `dom <css>` / `dom --text <str>` | structural probe; lists matches with tag/text/rect, piercing shadow roots (`--text` keeps the innermost match, `--all` adds the ancestors, `--within <css>` scopes it to a container) |
 | `eval '<js>'` | run JS, return the value |
 | `wait <css>` / `wait --text <str>` / `wait --js '<expr>'` | wait until content appears (`--timeout ms`) |
 | `upload <@eN\|css> <file...>` | set a file input |
@@ -72,8 +72,9 @@ profile. Say which one you used if the choice affects the user's account.
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
 `--port`, `--fast`, `--headed`, `--profile-dir`, `--dry-run`, `--chrome <path>`,
-plus `--text` / `--js` / `--nth` / `--exact` (matching), `--amount` / `--times`
-(scrolling) and `--front` (raise a hidden tab before sending input).
+plus `--text` / `--js` / `--nth` / `--exact` / `--within` (matching and scoping),
+`--amount` / `--times` (scrolling) and `--front` (raise a hidden tab before
+sending input).
 `--frame` applies to `snapshot`, `text`, `eval` and `wait`; the other commands act
 on the top document and say so if a frame is requested.
 
@@ -178,6 +179,13 @@ so a run can be resumed.
 - Modern sites hide content in nested web components. `dom`, `click --text`,
   `wait --text` and the accessibility snapshot see through open shadow roots; a
   hand-written `document.querySelector` does not.
+- Detail pages opened as an **overlay** keep the feed alive behind the mask, so an
+  unscoped `document.querySelector(".title")` happily returns a card the user
+  cannot see. Scope the read: `dom ".title" --within ".note-detail-mask"`, or
+  check `dom` for more matches than expected before trusting a value.
+- Some sites render their search box collapsed, or as an icon with no label:
+  `dom` reports it as `w:0,h:0` and `fill` refuses it (correctly). Use the site's
+  own search URL with `goto` instead of fighting the hidden control.
 
 ## Notes
 
