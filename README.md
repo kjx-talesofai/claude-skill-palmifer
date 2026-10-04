@@ -2,10 +2,6 @@
   <img src="assets/palmifer.jpg" alt="palmifer — 泡米饭" height="150"/>
 </p>
 
-<p align="center">
-  <img src="https://assets.hypersampling.com/hyper-sampling-2.jpg" alt="hypersampling" height="38"/>
-</p>
-
 # palmifer
 
 Let an AI agent drive **your** Chrome — the one you are already signed into — over CDP. One CLI, one small local daemon, no Node dependencies, no browser extension, no account.
@@ -117,6 +113,12 @@ The daemon starts itself on the first command and listens on `127.0.0.1:8798`; s
 Uninstall: `rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
 
 ## Author
+
+<p>
+  <a href="https://hypersampling.com">
+    <img src="https://assets.hypersampling.com/hyper-sampling-2.jpg" alt="hypersampling" height="38"/>
+  </a>
+</p>
 
 Built by [Jiaxin Kou](https://hypersampling.com) · [GitHub](https://github.com/kjx-talesofai)
 
