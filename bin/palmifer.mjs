@@ -16,6 +16,7 @@
  *   snapshot | text | click | fill | eval | wait | upload
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   close [tab] [--mine|--all] | stop
+ *   bench [--runs N] [--command "status"] [--json]   measure real latency
  *
  * Global flags:
  *   --tab <n|id|substr>      target tab (default: current)
@@ -1150,6 +1151,12 @@ if (cmd === "__serve") {
   } catch {
     out({ ok: true, note: "daemon was not running" });
   }
+} else if (cmd === "bench") {
+  const i = argv.indexOf("bench");
+  const child = spawn(process.execPath, [join(dirname(SELF), "bench.mjs"), ...argv.slice(i + 1)], {
+    stdio: "inherit",
+  });
+  child.on("exit", (code) => process.exit(code ?? 0));
 } else {
   // ---- thin client: make sure the daemon is up, then send the command ----
   async function healthy() {

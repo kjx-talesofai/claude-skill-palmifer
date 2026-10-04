@@ -45,6 +45,8 @@ palmifer status
 
 卸载：`rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
 
+**测速**：`palmifer bench` 只跑只读命令，把延迟拆成三层（进程启动 / daemon HTTP / 真实 CDP 往返），并单独测冷启动。
+
 **默认行为**：按"人的节奏"操作——带缓动的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔，也不让连续操作过密。只读任务可以用 `--fast` 跳过等待。
 
 </details>
@@ -113,6 +115,26 @@ palmifer screenshot /tmp/page.png
 The daemon starts itself on the first command and listens on `127.0.0.1:8798`; stop it with `palmifer stop`.
 
 `bin/palmifer` is a curl + jq shim for the common cases (~40 ms per call); `bin/palmifer.mjs` is the full CLI. Both accept every command — the shim needs `curl` and `jq`, the Node file needs nothing. The complete command and flag list lives in [SKILL.md](SKILL.md).
+
+## Benchmark
+
+```bash
+palmifer bench              # 8 runs per cell, read-only commands only
+palmifer bench --runs 20    # more runs, tighter medians
+palmifer bench --json       # machine-readable
+```
+
+Three layers are measured separately, because they have three different causes:
+
+| path | what it includes |
+|---|---|
+| `shim` | `bin/palmifer` (curl + jq) plus the process it starts |
+| `cli` | `bin/palmifer.mjs` — the same command with Node's startup added |
+| `http` | the daemon's own `POST /run` — no process spawn, so this is close to the raw CDP round trip |
+
+`cli - shim` is what Node's startup costs, `shim - http` is what starting curl + jq costs. A **cold start** row (daemon stopped first) shows the cost of spawning the daemon, the CDP handshake and the first answer together.
+
+Only read-only commands (`status`, `tabs`, `eval`) are used, so it is safe to run against a live browser.
 
 ## Notes
 

@@ -43,6 +43,7 @@ let them enable it, and retry.
 | `cdp <Domain.method> ['{json}']` | raw CDP (`--browser` = browser level) |
 | `close [tab] [--mine\|--all]` | close tabs |
 | `stop` | stop the local daemon |
+| `bench [--runs N] [--json]` | measure real latency; read-only |
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
 `--port`, `--fast`. `--frame` applies to `snapshot`, `text`, `eval` and `wait`; the
