@@ -23,6 +23,10 @@
  * Commands (run `palmifer help`):
  *   status | tabs | frames | use <tab> | open <url> | goto <url>
  *   snapshot | text | click | fill | press <key> | eval | wait | upload
+ *   front                                raise this tab (input only reaches a visible tab)
+ *   scroll <down|up|bottom|top>          real wheel events ([--amount N] [--times N])
+ *   dom <css> | dom --text <str>         structural probe; pierces shadow roots
+ *   click --text <str> [--nth N]         click a control by its label, no selector
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   anon <on|off|status>                 cookie-less context, no logins, no profile
  *   browser [url] [--headed]             start the throwaway browser (headless)
@@ -44,6 +48,12 @@
  *   --timeout <ms>           wait: give up after this (default 15000)
  *   --full                   screenshot: full page
  *   --fast                   skip the human pacing (see the pacing section)
+ *   --text <str>             wait/click/dom: match by visible text (pierces shadow roots)
+ *   --js <expr>              wait: poll an expression until it is truthy
+ *   --amount <px> --times N  scroll: how far, how often (bottom/top repeat until it stops)
+ *   --nth <n>                click --text: which match to use (default 1)
+ *   --exact                  text matching must be the whole label
+ *   --allow-network          eval: silence the "this talks to the network" warning
  *   --headed                 browser: visible window instead of headless
  *   --profile-dir <dir>      browser: keep the profile here (logins survive)
  *   --dry-run                browser: print the command line, launch nothing
@@ -70,6 +80,7 @@ import {
   rmSync,
   mkdtempSync,
   statfsSync,
+  statSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
@@ -97,6 +108,7 @@ const STATE_DIR = process.env.PALMIFER_STATE_DIR || join(homedir(), ".cache", "p
 const STATE_FILE = join(STATE_DIR, "state.json");
 const PID_FILE = join(STATE_DIR, "daemon.pid");
 const LOG_FILE = join(STATE_DIR, "daemon.log");
+const BUILD_FILE = join(STATE_DIR, "daemon.build.json");
 const DAEMON_PORT = Number(process.env.PALMIFER_DAEMON_PORT || 8798);
 // The hint has to match the mode: telling someone to click Allow in
 // chrome://inspect is useless when the browser at fault is our own headless one.
@@ -147,6 +159,12 @@ const VALUED = new Set([
   "seconds",
   "chrome",
   "profile-dir",
+  "text", // wait --text / click --text / dom --text take a value, not a bare flag
+  "selector",
+  "amount",
+  "times",
+  "nth",
+  "js",
 ]);
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -322,6 +340,22 @@ function resolveEndpoint() {
   return realEndpoint();
 }
 
+/**
+ * Identity of the code the daemon loaded. A long-lived daemon happily keeps
+ * running yesterday's file, so editing the CLI would look like "my change did
+ * nothing" — this is what lets the client say so out loud.
+ */
+function buildFingerprint() {
+  try {
+    const me = statSync(SELF);
+    const flags = join(dirname(SELF), "launch-flags.mjs");
+    const extra = existsSync(flags) ? statSync(flags) : null;
+    return `${Math.round(me.mtimeMs)}:${me.size}${extra ? `|${Math.round(extra.mtimeMs)}:${extra.size}` : ""}`;
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------- state
 
 function loadState() {
@@ -434,7 +468,27 @@ async function typeText(cdp, sessionId, text) {
 
 /** The default click: real input events, human pointer path, paced. */
 async function trustedClick(cdp, sessionId, sel) {
-  const rect = await elementRect(cdp, sessionId, sel);
+  return trustedClickAt(cdp, sessionId, await elementRect(cdp, sessionId, sel));
+}
+
+/**
+ * Chrome only feeds input events to the tab it is actually showing; a hidden
+ * tab swallows them and the CDP call sits there until it times out. Fail with
+ * something actionable instead of a 60-second silence.
+ */
+async function ensureVisible(cdp, sessionId) {
+  const vs = await evaluate(cdp, sessionId, "document.visibilityState").catch(() => "visible");
+  if (vs === "hidden") {
+    fail(
+      "this tab is in the background, so real input events would queue forever.\n" +
+        "  Run `palmifer front` to raise it, or pick a visible tab with --tab.",
+    );
+  }
+}
+
+/** Real mouse press/release at a point, with the human pointer path. */
+async function trustedClickAt(cdp, sessionId, rect) {
+  await ensureVisible(cdp, sessionId);
   await cdp.send("Emulation.setFocusEmulationEnabled", { enabled: true }, sessionId).catch(() => {});
   await movePointer(cdp, sessionId, rect.x, rect.y);
   if (isHuman()) await sleep(rand(30, 110));
@@ -796,6 +850,77 @@ const ACTIONABLE = new Set([
   "listbox", "option", "menuitem", "tab", "switch", "slider", "spinbutton",
 ]);
 
+
+// ---------------------------------------------------------------- deep lookups
+//
+// Modern sites render their content inside nested web components, so a plain
+// document.querySelector sees an empty shell. Everything below walks open
+// shadow roots too, because "read the page" has to mean the page the user sees.
+
+const DEEP_JS = `
+ function __palmRoots(){ const roots=[document]; const seen=new Set(roots);
+   for(let i=0;i<roots.length;i++){ let els; try{els=roots[i].querySelectorAll("*")}catch(e){continue}
+     for(const el of els){ if(el.shadowRoot&&!seen.has(el.shadowRoot)){ seen.add(el.shadowRoot); roots.push(el.shadowRoot) } } }
+   return roots }
+ function __palmText(el){ return ((el.innerText||el.textContent||"")+"").replace(/\\s+/g," ").trim() }
+ function __palmInteractive(el){ const t=el.tagName?el.tagName.toLowerCase():"";
+   return !!(t==="button"||t==="a"||t==="input"||t==="label"||t==="option"||t==="select"||el.getAttribute("role")==="button"
+     || (el.onclick!==undefined&&el.onclick!==null) || (function(){try{return getComputedStyle(el).cursor==="pointer"}catch(e){return false}})()) }
+ function __palmMatch(want,exact){ const hits=[];
+   for(const root of __palmRoots()){ let els; try{els=root.querySelectorAll("*")}catch(e){continue}
+     for(const el of els){ const own=__palmText(el); if(!own)continue;
+       if(exact?own===want:own.includes(want)){ const r=el.getBoundingClientRect();
+         hits.push({el,tag:el.tagName?el.tagName.toLowerCase():"",cls:(typeof el.className==="string"?el.className:"").slice(0,60),
+           text:own.slice(0,90),x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height,interactive:__palmInteractive(el)}) } } }
+   return hits }
+ function __palmRank(hits){ const vis=hits.filter(h=>h.w>=2&&h.h>=2);
+   // the innermost clickable thing wins: prefer real controls, then the smallest box
+   return vis.sort((a,b)=>(b.interactive-a.interactive)||(a.w*a.h-b.w*b.h)) }
+ function __palmPick(want,exact,nth){ const ranked=__palmRank(__palmMatch(want,exact));
+   const pick=ranked[nth-1]; if(!pick) return null;
+   pick.el.scrollIntoView({block:"center",inline:"center"});
+   const r=pick.el.getBoundingClientRect();
+   return {tag:pick.tag,cls:pick.cls,text:pick.text,interactive:pick.interactive,candidates:ranked.length,
+     x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height} }
+`;
+
+/** Click target found by its visible text, through shadow roots. */
+async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false } = {}) {
+  const expr = `(()=>{${DEEP_JS}
+    const p=__palmPick(${JSON.stringify(String(want))},${exact ? "true" : "false"},${Number(nth) || 1});
+    if(!p) return null;
+    return JSON.stringify(p)})()`;
+  const raw = await evaluate(cdp, sessionId, expr);
+  if (!raw) {
+    fail(
+      `no visible element with text ${exact ? "exactly " : ""}"${want}" — ` +
+        `\`palmifer dom --text "${want}"\` lists what did match (shadow roots included)`,
+    );
+  }
+  const rect = JSON.parse(raw);
+  if (rect.w < 2 || rect.h < 2) fail(`text "${want}" matched a zero-size element: ${rect.tag}.${rect.cls}`);
+  return rect;
+}
+
+/** Elements matching a CSS selector or text, shadow roots included. */
+async function deepQuery(cdp, sessionId, { selector = null, text = null, exact = false, limit = 20 }) {
+  const expr = `(()=>{${DEEP_JS}
+    const rows=[];
+    if(${selector ? "true" : "false"}){
+      for(const root of __palmRoots()){ let els; try{els=root.querySelectorAll(${JSON.stringify(selector || "")})}catch(e){return JSON.stringify([{error:String(e.message||e)}])}
+        for(const el of els){ const r=el.getBoundingClientRect();
+          rows.push({tag:el.tagName?el.tagName.toLowerCase():"",cls:(typeof el.className==="string"?el.className:"").slice(0,50),
+            text:__palmText(el).slice(0,90),interactive:__palmInteractive(el),shadow:root!==document,
+            x:Math.round(r.left+r.width/2),y:Math.round(r.top+r.height/2),w:Math.round(r.width),h:Math.round(r.height)}) } }
+    } else {
+      for(const h of __palmRank(__palmMatch(${JSON.stringify(String(text || ""))},${exact ? "true" : "false"}))){
+        rows.push({tag:h.tag,cls:h.cls,text:h.text,interactive:h.interactive,shadow:!!h.el.getRootNode().host,
+          x:Math.round(h.x),y:Math.round(h.y),w:Math.round(h.w),h:Math.round(h.h)}) } }
+    return JSON.stringify(rows.slice(0,${Number(limit) || 20}))})()`;
+  const raw = await evaluate(cdp, sessionId, expr);
+  return JSON.parse(raw || "[]");
+}
+
 // ---------------------------------------------------------------- keyboard
 //
 // `fill` sets a value; forms still need Enter, Tab or Escape. Keys go through
@@ -1060,6 +1185,13 @@ const commands = {
 
   async eval([code]) {
     if (!code) fail("usage: palmifer eval '<js>'");
+    if (!args["allow-network"] && /\b(fetch|XMLHttpRequest|sendBeacon|WebSocket)\s*\(/.test(code)) {
+      console.error(
+        "· this eval talks to the network. palmifer exists to drive the page; read the rendered\n" +
+          "  DOM (or `palmifer dom`) instead — that is what the site itself does, and it is the path\n" +
+          "  that does not get rate-limited. Pass --allow-network when a call is genuinely the point.",
+      );
+    }
     return withTab(async (cdp, sessionId) => {
       const frame = await resolveFrame(cdp, sessionId);
       let v;
@@ -1078,16 +1210,22 @@ const commands = {
   },
 
   async wait([target]) {
-    if (!target && !args.text) fail("usage: palmifer wait <css> | wait --text <str>");
+    if (!target && !args.text && !args.js) fail("usage: palmifer wait <css> | wait --text <str> | wait --js '<expr>'");
     const timeout = Number(args.timeout || 15000);
     const wantText = args.text ? String(args.text) : null;
+    const wantJs = args.js ? String(args.js) : null;
     return withTab(async (cdp, sessionId) => {
       const frame = await resolveFrame(cdp, sessionId);
       const ctx = frame ? await frameContext(cdp, sessionId, frame.id) : null;
       const deadline = Date.now() + timeout;
-      const expr = wantText
-        ? `document.body.innerText.includes(${JSON.stringify(wantText)})`
-        : `!!document.querySelector(${JSON.stringify(target)})`;
+      // --js is the escape hatch for "wait until the page has N of something",
+      // which is what a lazy-loaded SPA list actually needs. Text and CSS
+      // lookups pierce shadow roots so they work on web-component pages too.
+      const expr = wantJs
+        ? `(()=>{const v=(${wantJs});return !!v})()`
+        : wantText
+          ? `(()=>{${DEEP_JS} return __palmRoots().some(r=>__palmText(r.host||r).includes(${JSON.stringify(wantText)})||((r.body||r).innerText||"").includes(${JSON.stringify(wantText)}))})()`
+          : `(()=>{${DEEP_JS} for(const r of __palmRoots()){ try{ if((r.body||r).querySelector(${JSON.stringify(target)})) return true }catch(e){} } return false})()`;
       while (Date.now() < deadline) {
         const ok = await evaluate(cdp, sessionId, expr, ctx ? ctx.contextId : undefined).catch(() => false);
         if (ok) {
@@ -1096,15 +1234,104 @@ const commands = {
         }
         await sleep(250);
       }
-      fail(`wait timed out after ${timeout}ms: ${wantText ? `text "${wantText}"` : target}`);
+      fail(`wait timed out after ${timeout}ms: ${wantJs ? `js ${wantJs}` : wantText ? `text "${wantText}"` : target}`);
+    });
+  },
+
+  async front() {
+    // Explicit, not implicit: raising a window steals focus from whatever the
+    // user is doing, so it is its own command rather than a side effect of click.
+    return withTab(async (cdp, sessionId, target) => {
+      await cdp.send("Page.bringToFront", {}, sessionId).catch(() => {});
+      await sleep(250);
+      const visibility = await evaluate(cdp, sessionId, "document.visibilityState").catch(() => "?");
+      out({ tab: target.targetId, title: target.title.slice(0, 70), visibility });
+    });
+  },
+
+  async dom([target]) {
+    const selector = args.text ? null : target || args.selector;
+    const text = args.text ? String(args.text) : null;
+    if (!selector && !text) fail("usage: palmifer dom <css> | dom --text <str> [--exact] [--limit N]");
+    return withTab(async (cdp, sessionId, t) => {
+      const rows = await deepQuery(cdp, sessionId, {
+        selector,
+        text,
+        exact: !!args.exact,
+        limit: Number(args.limit || 20),
+      });
+      if (rows.length && rows[0].error) fail(`selector threw: ${rows[0].error}`);
+      out(rows.length ? rows : { matched: 0, note: `nothing matched ${text ? `text "${text}"` : selector} (shadow roots included)` });
+    });
+  },
+
+  async scroll([where]) {
+    const dir = (where || "down").toLowerCase();
+    if (!["down", "up", "bottom", "top"].includes(dir)) fail("usage: palmifer scroll <down|up|bottom|top> [--amount N] [--times N]");
+    let amount = Number(args.amount || 900);
+    if (dir === "up") amount = -Math.abs(amount);
+    const times = Math.max(1, Number(args.times || 1));
+    const maxSteps = dir === "bottom" || dir === "top" ? Math.max(times, Number(args.max || 30)) : times;
+    return withTab(async (cdp, sessionId) => {
+      await ensureVisible(cdp, sessionId);
+      const [vw, vh] = await evaluate(cdp, sessionId, "[innerWidth, innerHeight]");
+      const at = { x: Math.round(vw / 2), y: Math.round(vh / 2) };
+      const y0 = await evaluate(cdp, sessionId, "Math.round(scrollY)");
+      const h0 = await evaluate(cdp, sessionId, "document.body.scrollHeight");
+      let steps = 0;
+      let last = y0;
+      for (let i = 0; i < maxSteps; i++) {
+        // A wheel event is what a trackpad sends, so every scroll listener,
+        // lazy loader and infinite-scroll hook on the page sees a real gesture.
+        await cdp.send(
+          "Input.dispatchMouseEvent",
+          { type: "mouseWheel", x: at.x, y: at.y, deltaX: 0, deltaY: dir === "up" || dir === "top" ? -Math.abs(amount) : Math.abs(amount) },
+          sessionId,
+        );
+        steps++;
+        await sleep(isHuman() ? rand(240, 620) : 130);
+        const y = await evaluate(cdp, sessionId, "Math.round(scrollY)");
+        if ((dir === "bottom" || dir === "top") && y === last) break; // stop when it stops moving
+        last = y;
+      }
+      const y1 = await evaluate(cdp, sessionId, "Math.round(scrollY)");
+      const h1 = await evaluate(cdp, sessionId, "document.body.scrollHeight");
+      out({
+        scrolled: dir,
+        steps,
+        scrollY: y1,
+        moved: y1 - y0,
+        pageHeight: h1,
+        grewBy: h1 - h0,
+        human: isHuman(),
+      });
     });
   },
 
   async click([sel]) {
-    if (!sel) fail("usage: palmifer click <selector|@eN> [--fast]");
+    if (!sel && !args.text) fail("usage: palmifer click <selector|@eN> | click --text <label> [--nth N]");
     if (args.frame) fail("--frame is supported by snapshot/text/eval/wait; click acts on the top document");
     return withTab(async (cdp, sessionId, target) => {
       await paceAction();
+      if (args.text) {
+        // Click the thing by what it says. On a page whose controls are JS
+        // buttons with no href this is the only honest handle, and the two
+        // calls below find it through shadow roots.
+        const rect = await elementRectByText(cdp, sessionId, String(args.text), {
+          nth: Number(args.nth || 1),
+          exact: !!args.exact,
+        });
+        await trustedClickAt(cdp, sessionId, rect);
+        out({
+          clickedByText: String(args.text),
+          what: `${rect.tag}${rect.cls ? "." + rect.cls.split(" ")[0] : ""}: ${rect.text}`,
+          candidates: rect.candidates,
+          interactive: rect.interactive,
+          trusted: true,
+          at: { x: Math.round(rect.x), y: Math.round(rect.y) },
+        });
+        return;
+      }
       if (sel.startsWith("@e") && state.refsTab && state.refsTab !== target.targetId) {
         fail("@e refs were captured on another tab — run snapshot on this tab");
       }
@@ -1355,6 +1582,7 @@ const commands = {
     if (!key) fail("usage: palmifer press <key>   e.g. Enter, Tab, Escape, ArrowDown, Meta+A");
     return withTab(async (cdp, sessionId) => {
       await paceAction();
+      await ensureVisible(cdp, sessionId);
       const spec = keySpec(key);
       await cdp.send(
         "Input.dispatchKeyEvent",
@@ -1704,9 +1932,21 @@ const commands = {
 
   async close([which]) {
     const cdp = await getConn();
+    // Chrome with zero page targets has no window: input has nowhere to land and
+    // the browser looks broken to its owner. That is worth refusing once.
+    const pagesBefore = await pageTargets(cdp);
+    const guard = (n) => {
+      if (pagesBefore.length - n <= 0 && !args.force) {
+        fail(
+          "that would close the last tab and leave Chrome with no window at all.\n" +
+            "  Pass --force if you really mean it.",
+        );
+      }
+    };
     if (args.mine) {
       const pages = await pageTargets(cdp);
       const mine = pages.filter((p) => state.opened.includes(p.targetId));
+      guard(mine.length);
       for (const p of mine) await cdp.send("Target.closeTarget", { targetId: p.targetId });
       state.opened = state.opened.filter((id) => !mine.some((p) => p.targetId === id));
       if (mine.some((p) => p.targetId === state.current)) state.current = null;
@@ -1716,6 +1956,7 @@ const commands = {
     }
     if (args.all) {
       const pages = await pageTargets(cdp);
+      guard(pages.length);
       for (const p of pages) await cdp.send("Target.closeTarget", { targetId: p.targetId });
       state.current = null;
       state.refs = {};
@@ -1726,6 +1967,7 @@ const commands = {
     }
     if (which) args.tab = which;
     const target = await resolveTab(cdp);
+    guard(1);
     await cdp.send("Target.closeTarget", { targetId: target.targetId });
     // A closed tab must leave the "opened by me" set, otherwise `close --mine`
     // keeps counting a tab that no longer exists.
@@ -1806,6 +2048,7 @@ if (cmd === "__serve") {
   server.listen(DAEMON_PORT, "127.0.0.1", () => {
     console.log(`[palmifer] daemon on 127.0.0.1:${DAEMON_PORT} pid ${process.pid}`);
     writeFileSync(PID_FILE, String(process.pid));
+    writeJson(BUILD_FILE, { fingerprint: buildFingerprint(), pid: process.pid });
   });
   process.on("SIGTERM", () => process.exit(0));
 } else if (cmd === "stop") {
@@ -1861,6 +2104,15 @@ if (cmd === "__serve") {
     child.unref();
     for (let i = 0; i < 60 && !(await healthy()); i++) await sleep(250);
     if (!(await healthy())) fail("could not start the palmifer daemon (see ~/.cache/palmifer/daemon.log)");
+  }
+
+  const running = readJson(BUILD_FILE);
+  const onDisk = buildFingerprint();
+  if (running && onDisk && running.fingerprint && running.fingerprint !== onDisk) {
+    console.error(
+      "· the daemon is running older code than the CLI on disk — `palmifer stop` then retry\n" +
+        "  (reloading the daemon costs one Chrome approval).",
+    );
   }
 
   let data;

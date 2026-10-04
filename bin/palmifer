@@ -31,7 +31,7 @@ shift || true
 
 positional=()
 flags='{}'
-VALUED=" tab frame limit max port session filter timeout seconds chrome profile-dir text "
+VALUED=" tab frame limit max port session filter timeout seconds chrome profile-dir text selector amount times nth js "
 
 while [ $# -gt 0 ]; do
   case "$1" in

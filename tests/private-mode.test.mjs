@@ -20,7 +20,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,11 +66,31 @@ function palmiferRaw(...args) {
 // The probe server must live in its own process: every palmifer call here is
 // spawnSync, which blocks this process's event loop, so a server in-process
 // could never answer the page the browser is trying to load.
+const FIXTURE = `<!doctype html><html><head><meta charset="utf-8"><title>palmifer fixture</title></head><body>
+<h1>cookie probe</h1>
+<div id="tools">
+  <button id="lbl">下一页</button>
+  <div id="out">idle</div>
+  <div id="lazy"></div>
+  <div id="shadowhost"></div>
+</div>
+<div style="height:3000px"></div>
+`;
+// A page with a shadow-DOM control, a label-only button, a late element and a
+// tall body: exactly the shapes that broke the first real collection run.
+const FIXTURE_BODY = FIXTURE + `<script>
+  setTimeout(function(){document.getElementById('lazy').textContent='appeared';}, 1000);
+  document.getElementById('lbl').addEventListener('click', function(){document.getElementById('out').textContent='clicked-by-text';});
+  var host=document.getElementById('shadowhost');
+  var sr=host.attachShadow({mode:'open'});
+  sr.innerHTML='<button id="in-shadow">开始试炼</button>';
+  sr.querySelector('#in-shadow').addEventListener('click', function(){document.getElementById('out').textContent='clicked-in-shadow';});
+</script></body></html>`;
 const probeServer = spawn(
   process.execPath,
   [
     "-e",
-    `require("http").createServer((q,r)=>{r.setHeader("content-type","text/html");r.end("<h1>cookie probe</h1>")}).listen(${PORT},"127.0.0.1")`,
+    `require("http").createServer((q,r)=>{r.setHeader("content-type","text/html");r.end(${JSON.stringify(FIXTURE_BODY)})}).listen(${PORT},"127.0.0.1")`,
   ],
   { stdio: "ignore" },
 );
@@ -188,6 +208,53 @@ try {
   check("normal context kept its own cookie", backToNormal.text.includes("palmifer_probe=1"), backToNormal.text);
   const gone = palmifer("eval", 'document.cookie.includes("palmifer_anon")');
   check("anonymous cookie did not leak into the normal context", gone.text.includes("false"), gone.text);
+
+  console.log("\ndriver primitives: scroll / click --text / wait / dom");
+  palmifer("open", PROBE_URL);
+  const scrolled = palmifer("scroll", "down", "--amount", "500");
+  check("scroll moves the page with real wheel events", (scrolled.json?.moved || 0) > 0, scrolled.text);
+  const toBottom = palmifer("scroll", "bottom");
+  check("scroll bottom reaches the end", (toBottom.json?.scrollY || 0) > 1000, toBottom.text);
+  const toTop = palmifer("scroll", "top");
+  check("scroll top returns to the start", toTop.json?.scrollY === 0, toTop.text);
+
+  const inShadow = palmifer("dom", "--text", "开始试炼");
+  check("dom --text pierces the shadow root", Array.isArray(inShadow.json) && inShadow.json.some((r) => r.shadow === true), inShadow.text);
+  const byText = palmifer("click", "--text", "开始试炼");
+  check("click --text found the shadow control", /clicked|button/i.test(byText.json?.what || ""), byText.text);
+  const afterShadowClick = palmifer("eval", "document.getElementById('out').textContent");
+  check("click --text really activated it", afterShadowClick.text.includes("clicked-in-shadow"), afterShadowClick.text);
+
+  const byLabel = palmifer("click", "--text", "下一页");
+  check("click --text matches a label-only button", byLabel.json?.clickedByText === "下一页", byLabel.text);
+  const afterLabelClick = palmifer("eval", "document.getElementById('out').textContent");
+  check("the label-only button was clicked", afterLabelClick.text.includes("clicked-by-text"), afterLabelClick.text);
+
+  const waited = palmifer("wait", "--js", "document.getElementById('lazy').textContent==='appeared'", "--timeout", "5000");
+  check("wait --js resolves when a condition becomes true", waited.json?.ok === true, waited.text);
+  const waitedText = palmifer("wait", "--text", "appeared", "--timeout", "3000");
+  check("wait --text takes a value (regression: it used to search for \"true\")", waitedText.json?.ok === true, waitedText.text);
+  const timedOut = palmifer("wait", "--text", "never-appears-xyz", "--timeout", "800");
+  check("wait still times out loudly", timedOut.code !== 0 && /timed out/.test(timedOut.text), timedOut.text);
+
+  const guard = palmifer("eval", "fetch('http://127.0.0.1:1/')");
+  check("eval warns when the code uses the network", /talks to the network/.test(guard.text), guard.text);
+  const guarded = palmifer("eval", "--allow-network", "1+1");
+  check("--allow-network silences the warning", !/talks to the network/.test(guarded.text), guarded.text);
+
+  const beforeTouch = palmifer("status");
+  check("no staleness warning while the daemon matches the file", !/older code/.test(beforeTouch.text), beforeTouch.text);
+  const future = new Date(Date.now() + 5000);
+  utimesSync(CLI, future, future);
+  const afterTouch = palmifer("status");
+  check("daemon warns when the CLI on disk changed under it", /older code/.test(afterTouch.text), afterTouch.text);
+
+  const front = palmifer("front");
+  check("front raises the tab and reports it visible", front.json?.visibility === "visible", front.text);
+  const lastTab = palmifer("close", "--all");
+  check("closing the last tab is refused (Chrome would have no window)", lastTab.code !== 0 && /no window/.test(lastTab.text), lastTab.text);
+  const stillOpen = palmifer("status");
+  check("...and nothing was closed", stillOpen.json?.tabs > 0, JSON.stringify(stillOpen.json));
 
   console.log("\nback to the user's browser, then shut everything down");
   const priv = JSON.parse(readFileSync(join(STATE_DIR, "private.json"), "utf8"));
