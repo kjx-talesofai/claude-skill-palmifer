@@ -72,8 +72,8 @@ profile. Say which one you used if the choice affects the user's account.
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
 `--port`, `--fast`, `--headed`, `--profile-dir`, `--dry-run`, `--chrome <path>`,
-plus `--text` / `--js` / `--nth` / `--exact` (matching) and `--amount` / `--times`
-(scrolling).
+plus `--text` / `--js` / `--nth` / `--exact` (matching), `--amount` / `--times`
+(scrolling) and `--front` (raise a hidden tab before sending input).
 `--frame` applies to `snapshot`, `text`, `eval` and `wait`; the other commands act
 on the top document and say so if a frame is requested.
 
@@ -170,7 +170,9 @@ so a run can be resumed.
 - `target="_blank"` links can be popup-blocked: read the `href`, then `open` it.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
 - Chrome only feeds input to the tab it is showing: `scroll`/`click`/`fill`/`press`
-  refuse a hidden tab instead of hanging 60 s. Run `palmifer front` to raise it.
+  refuse a hidden tab instead of hanging 60 s. Run `palmifer front`, or pass
+  `--front` so the command raises the tab itself. Long unattended runs need
+  `--front`: the user will have wandered off to another tab long before it ends.
 - Closing the last tab leaves Chrome with no window at all; `close` refuses that
   unless you pass `--force`.
 - Modern sites hide content in nested web components. `dom`, `click --text`,

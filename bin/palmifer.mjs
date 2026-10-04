@@ -54,6 +54,7 @@
  *   --nth <n>                click --text: which match to use (default 1)
  *   --exact                  text matching must be the whole label
  *   --allow-network          eval: silence the "this talks to the network" warning
+ *   --front                  scroll/click/fill/press: raise the tab if it is hidden
  *   --headed                 browser: visible window instead of headless
  *   --profile-dir <dir>      browser: keep the profile here (logins survive)
  *   --dry-run                browser: print the command line, launch nothing
@@ -82,7 +83,7 @@ import {
   statfsSync,
   statSync,
 } from "node:fs";
-import { randomBytes } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join, dirname, delimiter, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -346,11 +347,12 @@ function resolveEndpoint() {
  * nothing" — this is what lets the client say so out loud.
  */
 function buildFingerprint() {
+  // Content, not mtime: copying the file (or touching it) is not a code change,
+  // and a warning that cries wolf is worse than no warning.
   try {
-    const me = statSync(SELF);
+    const hash = (f) => createHash("sha1").update(readFileSync(f)).digest("hex").slice(0, 12);
     const flags = join(dirname(SELF), "launch-flags.mjs");
-    const extra = existsSync(flags) ? statSync(flags) : null;
-    return `${Math.round(me.mtimeMs)}:${me.size}${extra ? `|${Math.round(extra.mtimeMs)}:${extra.size}` : ""}`;
+    return hash(SELF) + (existsSync(flags) ? "+" + hash(flags) : "");
   } catch {
     return null;
   }
@@ -477,13 +479,21 @@ async function trustedClick(cdp, sessionId, sel) {
  * something actionable instead of a 60-second silence.
  */
 async function ensureVisible(cdp, sessionId) {
-  const vs = await evaluate(cdp, sessionId, "document.visibilityState").catch(() => "visible");
-  if (vs === "hidden") {
-    fail(
-      "this tab is in the background, so real input events would queue forever.\n" +
-        "  Run `palmifer front` to raise it, or pick a visible tab with --tab.",
-    );
+  let vs = await evaluate(cdp, sessionId, "document.visibilityState").catch(() => "visible");
+  if (vs !== "hidden") return;
+  // --front is the caller saying "yes, raise it": unattended runs need this
+  // (a long collection drives whatever window the user has wandered off to),
+  // but stealing focus silently is not something a tool should decide alone.
+  if (args.front) {
+    await cdp.send("Page.bringToFront", {}, sessionId).catch(() => {});
+    await sleep(250);
+    vs = await evaluate(cdp, sessionId, "document.visibilityState").catch(() => "visible");
+    if (vs !== "hidden") return;
   }
+  fail(
+    "this tab is in the background, so real input events would queue forever.\n" +
+      "  Pass --front to raise it, run `palmifer front`, or pick a visible tab with --tab.",
+  );
 }
 
 /** Real mouse press/release at a point, with the human pointer path. */

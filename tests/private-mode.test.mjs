@@ -20,7 +20,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, existsSync, utimesSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -244,11 +244,23 @@ try {
 
   const beforeTouch = palmifer("status");
   check("no staleness warning while the daemon matches the file", !/older code/.test(beforeTouch.text), beforeTouch.text);
-  const future = new Date(Date.now() + 5000);
-  utimesSync(CLI, future, future);
+  const touches = new Date(Date.now() + 5000);
+  utimesSync(CLI, touches, touches);
   const afterTouch = palmifer("status");
-  check("daemon warns when the CLI on disk changed under it", /older code/.test(afterTouch.text), afterTouch.text);
+  check("touching the file (same content) does not warn", !/older code/.test(afterTouch.text), afterTouch.text);
+  const originalCli = readFileSync(CLI, "utf8");
+  try {
+    writeFileSync(CLI, originalCli + "\n// simulated edit by the test\n");
+    const afterEdit = palmifer("status");
+    check("daemon warns when the CLI content changed under it", /older code/.test(afterEdit.text), afterEdit.text);
+  } finally {
+    writeFileSync(CLI, originalCli);
+  }
 
+  console.log("\nback to the user's browser, then shut everything down");
+  const priv = JSON.parse(readFileSync(join(STATE_DIR, "private.json"), "utf8"));
+  const withFront = palmifer("scroll", "down", "--amount", "200", "--front");
+  check("--front is accepted on input commands", (withFront.json?.moved || 0) > 0, withFront.text);
   const front = palmifer("front");
   check("front raises the tab and reports it visible", front.json?.visibility === "visible", front.text);
   const lastTab = palmifer("close", "--all");
@@ -256,8 +268,6 @@ try {
   const stillOpen = palmifer("status");
   check("...and nothing was closed", stillOpen.json?.tabs > 0, JSON.stringify(stillOpen.json));
 
-  console.log("\nback to the user's browser, then shut everything down");
-  const priv = JSON.parse(readFileSync(join(STATE_DIR, "private.json"), "utf8"));
   const closed = palmifer("browser", "close");
   check("browser close reports the profile removed", closed.json?.profileRemoved === true, JSON.stringify(closed.json));
   check("mode returns to real", closed.json?.mode === "real", JSON.stringify(closed.json));

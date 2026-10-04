@@ -36,7 +36,9 @@ palmifer status
 
 需要 Node ≥ 22（自带 fetch 与 WebSocket），不需要 npm install。
 
-**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer press Enter` 回车提交 · `palmifer click "button"` 点击 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
+**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer press Enter` 回车提交 · `palmifer click --text "下一页"` 按文字点控件（穿透 shadow DOM）· `palmifer scroll bottom` 真实滚轮滚到底 · `palmifer wait --js '条件'` 等条件成立 · `palmifer dom ".item"` 看这页到底由什么组成 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
+
+**一条原则：驱动页面，别爬接口**。`eval` 能跑任意 JS，很容易让人绕过浏览器、直接 `fetch` 站内 API —— 那不是驱动浏览器，那是拿浏览器当爬虫壳。它跳过了用户眼前的页面，正好撞在风控上（B 站会开始返回 HTML，报出来是个莫名其妙的 `SyntaxError: Unexpected token '<'`），而且丢掉了这个工具唯一的优势：真实会话、像真页面一样加载。读**渲染出来的 DOM** 才是页面自己在做的事。`eval` 里出现 `fetch`/`XMLHttpRequest`/`sendBeacon`/`WebSocket` 会打一行警告，确实需要联网时用 `--allow-network`。
 
 **两种浏览器**：默认操作**你自己的 Chrome**（带你所有登录态）。如果不想用你的浏览器、或者没人在旁边点 Allow（服务器、CI、无人值守），用 `palmifer browser` —— 它自己起一个全新的临时 profile 的 Chrome，**默认无头**，不用授权、没有任何你的数据；`palmifer browser close` 退出并删掉临时 profile。`palmifer anon on` 是在**当前浏览器里**开一个没有 cookie 的匿名上下文（Chrome 会为它单开一个窗口），任务跑完 `palmifer anon off` 关掉。三者区别：
 
@@ -130,12 +132,31 @@ palmifer snapshot                     # accessibility tree with @eN refs
 palmifer fill @e10 "search terms"     # @eN comes from the snapshot above
 palmifer press Enter                  # real key event: Enter, Tab, Escape, Meta+A
 palmifer click "button[type=submit]"
+palmifer click --text "下一页"          # click a control by its label, shadow roots included
+palmifer scroll bottom                # real wheel events until the page stops moving
+palmifer wait --js 'document.querySelectorAll(".item").length>20'
+palmifer dom ".item" --limit 5        # what is this page actually made of?
 palmifer screenshot /tmp/page.png
 ```
 
 The daemon starts itself on the first command and listens on `127.0.0.1:8798`; stop it with `palmifer stop`.
 
 `bin/palmifer` is a curl + jq shim for the common cases (~40 ms per call); `bin/palmifer.mjs` is the full CLI. Both accept every command — the shim needs `curl` and `jq`, the Node file needs nothing. The complete command and flag list lives in [SKILL.md](SKILL.md).
+
+## Drive the page, don't scrape the site
+
+`eval` can run any JavaScript, which makes it tempting to skip the browser and
+call the site's own API with `fetch()` instead. Don't: that is not driving a
+browser, it is scraping through one. It skips the page the user is looking at, it
+is precisely what rate limits and risk control are built to catch — bilibili
+starts answering with HTML, which surfaces as a baffling
+`SyntaxError: Unexpected token '<'` — and it throws away the only advantage this
+tool has, which is a real session behaving like a real page load.
+
+Reading the rendered DOM *is* what the page does, and it stays inside what the
+site expects. `eval` prints a warning when the code contains
+`fetch()`/`XMLHttpRequest`/`sendBeacon()`/`WebSocket()`; `--allow-network` exists
+for the rare case where a call really is the point.
 
 ## Two browsers, three levels of privacy
 
