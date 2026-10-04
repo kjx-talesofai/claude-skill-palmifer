@@ -360,6 +360,14 @@ async function pageTargets(cdp) {
   return targetInfos.filter((t) => t.type === "page");
 }
 
+/** Forget tabs we opened that no longer exist — a user can close them at any time. */
+function pruneOpened(pages) {
+  const before = state.opened.length;
+  state.opened = state.opened.filter((id) => pages.some((p) => p.targetId === id));
+  if (state.opened.length !== before) saveState(state);
+  return state.opened;
+}
+
 async function attach(cdp, targetId) {
   const { sessionId } = await cdp.send("Target.attachToTarget", { targetId, flatten: true });
   for (const m of ["Runtime.enable", "Page.enable", "DOM.enable"]) {
@@ -579,7 +587,7 @@ const commands = {
       protocol: v.protocolVersion,
       tabs: pages.length,
       current: state.current,
-      openedByMe: state.opened.length,
+      openedByMe: pruneOpened(pages).length,
       networkCapturing: !!net,
       daemon: true,
     });
@@ -588,12 +596,13 @@ const commands = {
   async tabs() {
     const cdp = await getConn();
     const pages = await pageTargets(cdp);
+    const mine = pruneOpened(pages);
     out(
       pages.map((t, i) => ({
         i,
         id: t.targetId,
         current: t.targetId === state.current,
-        mine: state.opened.includes(t.targetId),
+        mine: mine.includes(t.targetId),
         title: t.title.slice(0, 70),
         url: t.url.slice(0, 100),
       })),
@@ -1060,10 +1069,11 @@ const commands = {
     if (which) args.tab = which;
     const target = await resolveTab(cdp);
     await cdp.send("Target.closeTarget", { targetId: target.targetId });
-    if (state.current === target.targetId) {
-      state.current = null;
-      saveState(state);
-    }
+    // A closed tab must leave the "opened by me" set, otherwise `close --mine`
+    // keeps counting a tab that no longer exists.
+    state.opened = state.opened.filter((id) => id !== target.targetId);
+    if (state.current === target.targetId) state.current = null;
+    saveState(state);
     out({ closed: target.targetId, title: target.title });
   },
 };

@@ -120,56 +120,52 @@ The daemon starts itself on the first command and listens on `127.0.0.1:8798`; s
 
 ## Benchmark
 
-```bash
-palmifer bench              # 8 runs per cell, read-only commands only
-palmifer bench --runs 20    # more runs, tighter medians
-palmifer bench --json       # machine-readable
-palmifer bench --cold       # also measure a cold start (see below)
-```
+`palmifer bench` measures whole calls, not IPC latency. Numbers below: macOS arm64, Node 26.3, Chrome 155, a
+generated fixture page (300 rows + a form) with every command pinned to that tab, 25 samples per cell after
+3 discarded warm-up calls.
 
-Three layers are measured separately, because they have three different causes:
+| command | shim p50 | cli p50 | http p50 | http p90 | sd (shim) |
+|---|---|---|---|---|---|
+| `status` | 43.3 ms | 129.8 ms | 1.9 ms | 2.1 ms | 1.2 |
+| `tabs` | 43.8 ms | 131.6 ms | 1.4 ms | 1.8 ms | 5.0 |
+| `eval 1+1` | 45.9 ms | 133.8 ms | 3.8 ms | 5.3 ms | 2.0 |
+| `text` | 49.4 ms | 135.5 ms | 5.0 ms | 6.5 ms | 1.8 |
+| `snapshot --actionable-only` | 101.0 ms | 187.4 ms | 50.6 ms | 53.2 ms | 5.2 |
+| `snapshot` | 97.3 ms | 184.8 ms | 49.9 ms | 52.8 ms | 2.0 |
+| `screenshot` | 95.0 ms | 184.7 ms | 41.9 ms | 55.7 ms | 4.7 |
 
-| path | what it includes |
-|---|---|
-| `shim` | `bin/palmifer` (curl + jq) plus the process it starts |
-| `cli` | `bin/palmifer.mjs` — the same command with Node's startup added |
-| `http` | the daemon's own `POST /run` — no process spawn, so this is close to the raw CDP round trip |
+Writes, measured in a separate run with the burst guard lifted (`PALMIFER_ACTION_CAP=10000`), because
+otherwise the guard refuses them and you end up benchmarking the guard:
 
-A run on the author's machine (macOS arm64, Node 26, Chrome 155), 10 runs per cell:
-
-```
-command       path           min     median        max
-status        shim       36.0 ms    37.1 ms    40.6 ms
-status        cli         127 ms     129 ms     132 ms
-status        http        1.0 ms     1.5 ms    39.0 ms
-tabs          shim       36.1 ms    37.6 ms    39.1 ms
-tabs          cli         127 ms     129 ms     149 ms
-tabs          http        0.6 ms     0.7 ms     1.6 ms
-eval 1+1      shim       38.7 ms    40.7 ms    44.1 ms
-eval 1+1      cli         128 ms     130 ms     133 ms
-eval 1+1      http        2.4 ms     2.6 ms     4.3 ms
-```
-
-What that says: a CDP round trip through the daemon is **1–3 ms**. The shim's extra ~36 ms is curl + jq + one process; the Node CLI's extra ~130 ms is Node's own startup. Process startup, not the browser, is the cost — which is why `bin/palmifer` exists at all.
-
-Writes cost real time by design — that is the "look human" budget, spent on purpose:
-
-| action | `--fast` | default (paced) |
+| action | `--fast` (n=10) | default, paced (n=5) |
 |---|---|---|
-| `fill` a 2-character value | 43 ms | ~1.4 s |
-| `click` a button | 43 ms | ~1.1 s |
-| `snapshot` (300-row page) | — | 91 ms |
-| `screenshot` | 65 ms | 65 ms |
+| `fill` a 2-character value | 49.7 ms | 1.20 s |
+| `click` a button | 50.5 ms | 1.18 s |
 
-The paced numbers are one spacing gap (≥1.2 s between write actions), per-character typing (45–140 ms) and an eased pointer path. `--fast` skips the waiting; use it for read-only work or when speed matters more than looking like a person.
+**Reading it.** `http` is the daemon's own round trip with no process spawn, so it is close to the raw CDP
+call: 1.4–5 ms for cheap commands, ~50 ms for an accessibility snapshot. `shim − http` is curl + jq + one
+process (~40 ms); `cli − shim` is Node's startup (~85 ms). **Process startup, not the browser, dominates
+every call** — which is the only reason `bin/palmifer` exists. Paced writes are the design budget: one
+spacing gap (≥1.2 s), per-character typing (45–140 ms) and an eased pointer path. `--fast` skips the waiting.
 
-The daemon itself sits at ~97 MB RSS while holding a live CDP connection — Node's baseline, not the payload.
+**Methodology**, so the numbers can be argued with:
 
-`--cold` is off by default for a reason: it restarts the daemon, Chrome sees a new client and asks for approval again, and your click would land inside the measurement.
+- one child process per measured call, wall time from a monotonic clock
+- `--warmup 3` calls per cell are discarded before sampling
+- path order rotates each iteration, so drift (CPU ramp, page state) is shared instead of owned by one path
+- failures are counted and printed with their reason, never dropped from the sample
+- `--json` emits every raw sample, so the statistics can be recomputed
+- `--full` generates the fixture, pins the tab per call, and closes it afterwards
+- `--cold` is opt-in: it restarts the daemon, Chrome asks for approval again, and your click would land
+  inside the measurement — the one number a benchmark cannot take for you
 
-`cli - shim` is what Node's startup costs, `shim - http` is what starting curl + jq costs. A **cold start** row (daemon stopped first) shows the cost of spawning the daemon, the CDP handshake and the first answer together.
+It does not measure network time, page load, or any other tool.
 
-Only read-only commands (`status`, `tabs`, `eval`) are used, so it is safe to run against a live browser.
+```bash
+palmifer bench --full --runs 25     # publishable run
+palmifer bench --json > bench.json  # raw samples
+palmifer bench                      # quick look at the current tab
+```
 
 ## Notes
 
