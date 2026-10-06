@@ -45,22 +45,24 @@ profile. Say which one you used if the choice affects the user's account.
 
 | Command | Does |
 |---|---|
-| `status` / `tabs` / `frames` | browser version, tabs, iframes (`#fN`) |
+| `status` / `tabs` / `frames` | browser version, tabs, iframes (`#fN`); `status` answers even when the browser is gone (`reachable:false`) |
 | `use <n\|id\|url>` | select a tab |
-| `open <url>` / `goto <url>` | new tab / navigate the current one |
+| `open <url>` / `goto <url>` | new tab / navigate the current one (`goto` reports the `previousUrl` it replaced) |
 | `snapshot` | accessibility tree with `@eN` refs (`--actionable-only`, `--filter`, `--limit`) |
 | `text` | visible text of the page or a frame |
 | `click <@eN\|css>` / `click --text <label>` | interact; `--nth N` picks the Nth match (CSS or text), `--text` finds the control by what it says (shadow roots included) |
-| `fill <@eN\|css> <value>` | type into a field with real input events |
+| `click-at <x> <y>` | trusted click at a point: the handle for a canvas, an icon-only control, or anything inside a frame (`--frame` makes the point frame-relative) |
+| `fill <@eN\|css> <value>` | type into a field, replacing what is there |
+| `type-at <x> <y> "<text>" [--append]` | click a point and type there; replaces unless `--append` |
 | `press <Enter\|Tab\|Escape\|ArrowDown\|Meta+A>` | one real key event |
-| `scroll <down\|up\|bottom\|top>` | real wheel events (`--amount N`, `--times N`); bottom/top repeat until the page stops moving |
+| `scroll <down\|up\|bottom\|top>` | real wheel events (`--amount N` in pixels, `--times N`); bottom/top repeat until the page stops moving. Reports `scrollY`, `moved`, `grewBy` |
 | `front` | raise this tab — input only reaches a visible tab |
 | `dom <css>` / `dom --text <str>` | structural probe; lists matches with tag/text/rect, piercing shadow roots (`--text` keeps the innermost match, `--all` adds the ancestors, `--within <css>` scopes it to a container) |
-| `eval '<js>'` | run JS, return the value |
+| `eval '<js>'` / `eval --file <path>` | run JS, return the value |
 | `wait <css>` / `wait --text <str>` / `wait --js '<expr>'` | wait until content appears (`--timeout ms`) |
 | `upload <@eN\|css> <file...>` | set a file input |
-| `screenshot [path] [--full]` / `pdf [path]` | capture to a file |
-| `network start\|list\|detail\|stop` | capture requests and bodies |
+| `screenshot [path] [--full] [--scale N] [--max-width N] [--annotate]` / `pdf [path]` | capture to a file; the extension picks the format, `--annotate` draws the `@eN` numbers from the last snapshot |
+| `network start\|list\|detail\|stop` | capture requests and bodies (`detail` takes the id or the row number from `list`) |
 | `cdp <Domain.method> ['{json}']` | raw CDP (`--browser` = browser level) |
 | `anon <on\|off\|status>` | cookie-less context, no logins |
 | `browser [url] [--headed] [--profile-dir <dir>] [--dry-run]` | the browser palmifer starts itself |
@@ -72,12 +74,18 @@ profile. Say which one you used if the choice affects the user's account.
 | `mem` | daemon memory (heap after a forced GC) |
 
 Flags: `--tab`, `--frame`, `--limit`, `--max`, `--timeout`, `--full`, `--browser`,
-`--port`, `--fast`, `--headed`, `--profile-dir`, `--dry-run`, `--chrome <path>`,
+`--port`, `--fast`, `--synthetic`, `--headed`, `--profile-dir`, `--dry-run`,
+`--chrome <path>`, `--scale`, `--max-width`, `--quality`, `--annotate`, `--verify`,
 plus `--text` / `--js` / `--nth` / `--exact` / `--within` (matching and scoping),
 `--amount` / `--times` (scrolling) and `--front` (raise a hidden tab before
 sending input).
-`--frame` applies to `snapshot`, `text`, `eval` and `wait`; the other commands act
-on the top document and say so if a frame is requested.
+
+`--frame` works on `snapshot`, `text`, `dom`, `eval`, `wait`, `click`, `fill`,
+`upload`, `click-at` and `type-at`: the element or point is resolved inside that
+frame and translated to page coordinates. Coordinates palmifer prints are page
+coordinates; with `--frame` on `click-at`/`type-at` the ones you pass are
+frame-relative. Same-origin frames are the supported case; a cross-origin frame
+can still be read with `--frame` but not measured, and says so.
 
 ## On a headless server
 
@@ -104,7 +112,25 @@ the exact command line if a launch fails.
 Actions are paced the way a person using the browser is paced: real input events,
 an eased pointer path, character-by-character typing, a pause after navigation,
 spacing between actions, and a burst cap. This is the default; `--fast` drops the
-pauses for read-only commands or when the user asks for speed.
+waiting for read-only commands or when the user asks for speed.
+
+**`--fast` never changes what the page receives.** Real input events are always
+used, because a page that checks `event.isTrusted` ignores `el.click()` and the
+action then fails silently. `--synthetic` is the explicit opt-in for the
+untrusted shortcut; every action reports which one it used (`"input":"real"` or
+`"synthetic"`).
+
+`click`, `fill`, `press`, `click-at` and `type-at` also report what changed around
+the action, so a separate read-back is normally unnecessary:
+
+```json
+"effect": {"urlChanged": false, "titleChanged": false, "domDelta": 12, "requests": 1}
+```
+
+`domDelta` on a virtualised list is noisy by nature — treat the numbers as
+signals, not proof. `--verify <css>` is the explicit form: it polls for up to 2 s
+and answers `"verified": true|false`; a leading `!` asks for the element to be
+gone (`--verify "!.spinner"`).
 
 The first command against a new host prints a one-line notice. Relay it once, in
 the user's language ("acting on <host> with human-paced defaults; say faster to
@@ -112,6 +138,21 @@ skip"), then carry on.
 
 If a site pushes back — a verification prompt, a rate limit, an action that
 silently disappears — stop and tell the user instead of retrying.
+
+## Several agents on one machine
+
+One daemon has one `current` tab, one `@eN` table and one action budget, so two
+agents driving it will keep changing each other's tab. Give each agent its own
+daemon and state directory; they can share the same Chrome:
+
+```bash
+export PALMIFER_STATE_DIR=~/.cache/palmifer-agent2
+export PALMIFER_DAEMON_PORT=8799
+```
+
+Then pass `--tab` explicitly instead of relying on "current". A command whose
+implicit `current` tab was closed elsewhere falls back to a live tab and says so;
+an explicit `--tab` that cannot be resolved still fails.
 
 ## Read the page, do not fetch the site
 
@@ -162,18 +203,24 @@ so a run can be resumed.
 ## Gotchas
 
 - Prefer the site's own links and controls over hand-built deep links.
-- Pages that check `event.isTrusted` ignore synthetic `el.click()`; the default
-  already sends real input events, so only `--fast` runs into this.
+- Pages that check `event.isTrusted` ignore synthetic `el.click()`: palmifer sends
+  real input by default and under `--fast`, so this only comes up if you ask for
+  `--synthetic` yourself.
 - A selector matching a zero-size element is rejected rather than clicked at (0, 0).
 - Reactive lists re-render: resolve and act in one call.
 - `chrome://` tabs work, but their target id can change after load — select by URL.
-- `--frame` fails loudly when nothing matches; cross-origin frames need their own
-  execution context.
+- `screenshot` picks the format from the file extension (`.png` really is PNG) and
+  reports an absolute path; a relative path is relative to **your** working
+  directory. The content inside a `.png` name is never JPEG.
+- `--frame` fails loudly when nothing matches. Same-origin frames can be read,
+  clicked and filled; a cross-origin frame can be read but its position on the
+  page cannot be measured, so acting there needs `cdp Input.dispatchMouseEvent`.
 - `target="_blank"` links can be popup-blocked: read the `href`, then `open` it.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
 - No command hangs forever. Each one gets a budget (20 s for cheap calls, 60 s for
   navigation/scroll, `wait` = its `--timeout` + 5 s); when it runs out the error
-  names the command and what to check. `PALMIFER_CMD_BUDGET_MS` changes it.
+  names the command and what to check. `PALMIFER_CMD_BUDGET_MS` changes it, and an
+  explicit `--timeout` on `wait` raises it to at least that long.
   A command stuck mid-flight is stopped with `palmifer cancel` — which keeps the
   daemon, so the Chrome approval is not lost.
 - Chrome only feeds input to the tab it is showing: `scroll`/`click`/`fill`/`press`
@@ -195,6 +242,9 @@ so a run can be resumed.
 - Some sites render their search box collapsed, or as an icon with no label:
   `dom` reports it as `w:0,h:0` and `fill` refuses it (correctly). Use the site's
   own search URL with `goto` instead of fighting the hidden control.
+- A throwaway browser (`browser`) closes itself after 30 minutes without a
+  command; a `--profile-dir` one never does. `PALMIFER_PRIVATE_IDLE_MIN` changes
+  the first. `browser status` and `status` keep working afterwards.
 
 ## Notes
 

@@ -36,7 +36,7 @@ palmifer status
 
 需要 Node ≥ 22（自带 fetch 与 WebSocket），不需要 npm install。
 
-**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer press Enter` 回车提交 · `palmifer click --text "下一页"` 按文字点控件（穿透 shadow DOM）· `palmifer scroll bottom` 真实滚轮滚到底 · `palmifer wait --js '条件'` 等条件成立 · `palmifer dom ".item"` 看这页到底由什么组成 · `palmifer screenshot /tmp/a.png` 截图。完整清单见 [SKILL.md](SKILL.md)。
+**常用命令**：`palmifer open <url>` 打开页面 · `palmifer snapshot` 给 agent 读的页面结构（带 `@eN` 引用）· `palmifer fill @e10 "关键词"` 填表 · `palmifer press Enter` 回车提交 · `palmifer click --text "下一页"` 按文字点控件（穿透 shadow DOM）· `palmifer click "#follow" --verify '[data-testid$="-unfollow"]'` 点完直接告诉你有没有生效 · `palmifer click "#inner-btn" --frame '#g_iframe'` 在内容 iframe 里操作 · `palmifer click-at 640 380` 按坐标点（选择器够不到的东西）· `palmifer scroll bottom` 真实滚轮滚到底 · `palmifer wait --js '条件'` 等条件成立 · `palmifer dom ".item"` 看这页到底由什么组成 · `palmifer screenshot /tmp/a.png` 截图（`.png` 就是 PNG，另有 `--scale` / `--max-width` / `--annotate`）。完整清单见 [SKILL.md](SKILL.md)。
 
 **一条原则：驱动页面，别爬接口**。`eval` 能跑任意 JS，很容易让人绕过浏览器、直接 `fetch` 站内 API —— 那不是驱动浏览器，那是拿浏览器当爬虫壳。它跳过了用户眼前的页面，正好撞在风控上（B 站会开始返回 HTML，报出来是个莫名其妙的 `SyntaxError: Unexpected token '<'`），而且丢掉了这个工具唯一的优势：真实会话、像真页面一样加载。读**渲染出来的 DOM** 才是页面自己在做的事。`eval` 里出现 `fetch`/`XMLHttpRequest`/`sendBeacon`/`WebSocket` 会打一行警告，确实需要联网时用 `--allow-network`。
 
@@ -51,7 +51,7 @@ palmifer status
 
 **VPS / 服务器**：`palmifer browser --profile-dir ~/.palmifer-profile <url>` —— 无头、不用点 Allow、profile 持久（登一次就一直在）。Linux 上启动参数会自适应：root、或内核关了 unprivileged user namespace，自动加 `--no-sandbox`；`/dev/shm` 小于 512MB 自动加 `--disable-dev-shm-usage`；其它用 `PALMIFER_CHROME_FLAGS` 加（截图中文页记得装中文字体）。`browser close` 先发 `Browser.close` 优雅退出，cookie / localStorage 会刷盘，所以下次启动还在。daemon 只监听 `127.0.0.1`，agent 得跑在同一台机器上。**老实说**：这份只在 macOS 上端到端跑过，我没有 Linux 机器实测；Linux 专属那套启动参数是用单元测试在 macOS 上锁住的，`palmifer browser --dry-run` 会打印它实际要跑的命令行。
 
-匿名隔离和持久 profile 都是**测过的、不是口头保证**：`node tests/private-mode.test.mjs`（60 项）会种一个持久 cookie + 一个 localStorage，重启浏览器后确认还在；匿名上下文则确认读不到普通 profile 的 cookie。
+匿名隔离和持久 profile 都是**测过的、不是口头保证**：`node tests/private-mode.test.mjs`（93 项）会种一个持久 cookie + 一个 localStorage，重启浏览器后确认还在；匿名上下文则确认读不到普通 profile 的 cookie。另有 `tests/iframe.test.mjs`（25 项，同源 / 嵌套 iframe 的读与点、坐标换算）和 `tests/robustness.test.mjs`（62 项：截图格式与路径、`--fast` 的输入通道、被外部关掉的 current tab、沙箱里没有 `ps`、显式 `--timeout` 的优先级、日志轮转与闲置回收）。
 
 **注意事项**：
 
@@ -62,11 +62,11 @@ palmifer status
 
 卸载：`rm -rf ~/.agents/skills/palmifer ~/.cache/palmifer`
 
-**授权**：Chrome 是**按连接方**逐次授权的 —— daemon 启动时连一次，所以是「每次 daemon 启动点一次 Allow」，之后的命令都不再弹窗。
+**授权**：Chrome 是**按连接方**逐次授权的 —— daemon 启动时连一次，所以是「每次 daemon 启动点一次 Allow」，之后的命令都不再弹窗。多个 agent 同时用同一个 Chrome 时，各自给一套 `PALMIFER_STATE_DIR` + `PALMIFER_DAEMON_PORT`，并用 `--tab` 显式指定标签页。
 
 **测速**：`palmifer bench` 只跑只读命令，把延迟拆成三层（进程启动 / daemon HTTP / 真实 CDP 往返），并单独测冷启动。
 
-**默认行为**：按"人的节奏"操作——带缓动的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔，也不让连续操作过密。只读任务可以用 `--fast` 跳过等待。
+**默认行为**：按"人的节奏"操作——带缓动的鼠标轨迹、逐字输入、导航后停顿、动作之间留间隔，也不让连续操作过密。`--fast` 只跳过等待，**不改变页面收到的输入事件**（真实事件始终保留，因为检查 `event.isTrusted` 的页面会忽略合成点击）；确实要合成 `el.click()` 时显式用 `--synthetic`。动作默认回报 `effect`（URL / 标题 / DOM 变化量 / 期间的请求数），需要断言时用 `--verify <css>`。
 
 </details>
 
@@ -85,15 +85,17 @@ Worth saying plainly, because it comes up: [browser-use](https://github.com/brow
 
 ## How it works
 
-Chrome 136+ refuses `--remote-debugging-port` on the default profile. Chrome 155 and later ship a per-instance opt-in instead: tick *"Allow remote debugging for this browser instance"* at `chrome://inspect/#remote-debugging`, and Chrome exposes a loopback CDP endpoint.
+Chrome 136+ refuses `--remote-debugging-port` on the default profile. Chrome 144 and later ship a per-instance opt-in instead: tick *"Allow remote debugging for this browser instance"* at `chrome://inspect/#remote-debugging`, and Chrome exposes a loopback CDP endpoint.
 
 palmifer speaks CDP to that endpoint:
 
 - **One file.** `bin/palmifer.mjs` is the whole CLI and daemon — Node >= 22, no dependency tree, no build step.
 - **One connection.** Chrome asks for approval whenever a new client connects, so a long-lived daemon holds the single CDP session: you click *Allow* once per daemon start, not once per command.
 - **Your browser by default, its own when yours is not there.** `palmifer browser` starts a throwaway Chrome in a temp profile — headless, no opt-in click, no logins — for servers, CI and unattended runs. `palmifer anon on` gives the browser already in use a cookie-less context instead.
-- **Real input.** Clicks and typing go through the browser's own input pipeline, so pages that reject synthetic events behave normally.
-- **Human-paced by default.** An eased pointer path, character-by-character typing, a pause after navigation, spacing between actions and a cap on action bursts. `--fast` opts out for read-only work.
+- **Real input, always.** Clicks and typing go through the browser's own input pipeline, so pages that reject synthetic events behave normally. `--fast` only removes the waiting; `--synthetic` is the explicit opt-in for `el.click()`.
+- **Human-paced by default.** An eased pointer path, character-by-character typing, a pause after navigation, spacing between actions and a cap on action bursts.
+- **Frames are first-class.** A same-origin content frame — the `#g_iframe` shape that music.163.com and plenty of other Chinese sites use — can be read *and* acted on: elements are resolved inside the frame and their coordinates translated to the page. `click-at X Y` / `type-at X Y "text"` are there for anything a selector cannot reach.
+- **An action says what it did.** `click`, `fill`, `press`, `click-at` and `type-at` return an `effect` (`urlChanged`, `titleChanged`, `domDelta`, `requests`), and `--verify <css>` polls for the element you expect to appear. That is normally one call instead of two.
 - **Nothing to escape.** `cdp <Domain.method>` passes any raw CDP command through when the built-in commands are not enough.
 
 ## Install
@@ -136,7 +138,10 @@ palmifer click --text "下一页"          # click a control by its label, shado
 palmifer scroll bottom                # real wheel events until the page stops moving
 palmifer wait --js 'document.querySelectorAll(".item").length>20'
 palmifer dom ".item" --limit 5        # what is this page actually made of?
-palmifer screenshot /tmp/page.png
+palmifer click "#follow" --verify '[data-testid$="-unfollow"]'   # did it land?
+palmifer click "#inner-btn" --frame "#g_iframe"                  # act inside a content frame
+palmifer click-at 640 380             # a point, for what a selector cannot reach
+palmifer screenshot /tmp/page.png     # .png is PNG; --scale / --max-width / --annotate
 ```
 
 The daemon starts itself on the first command and listens on `127.0.0.1:8798`; stop it with `palmifer stop`.
@@ -217,22 +222,36 @@ palmifer browser && palmifer status   # does it actually come up
 ## Tests
 
 ```bash
-node tests/private-mode.test.mjs      # 60 checks, needs Node >= 22 and Chrome
+node tests/private-mode.test.mjs   # 93 checks — browsers, privacy, budgets
+node tests/iframe.test.mjs         # 25 checks — frames, coordinates, points
+node tests/robustness.test.mjs     # 62 checks — output files, input trust, tab pointers
 ```
 
-It uses its own daemon port and its own state directory, so it never touches the
-palmifer you use day to day, and it only ever drives the browser palmifer starts —
-your own Chrome is not contacted. What it actually pins down:
+Each uses its own daemon port and state directory, so they never touch the
+palmifer you use day to day, and they only ever drive the browser palmifer
+starts — your own Chrome is not contacted.
 
-- anonymity, with a real cookie: set in the normal context, survives a reopen
-  there, invisible in the anonymous context, back after `anon off`;
-- `--profile-dir`: a cookie and a `localStorage` key survive a **full browser
-  restart**, and the profile is still there after `close` (a session cookie would
-  prove nothing, so the test sets a durable one);
-- launch flags for the combinations this machine cannot run: root and
-  small-`/dev/shm` on Linux, `macOS` never getting `--no-sandbox`;
-- `--dry-run` launching nothing and not switching the active browser;
-- the temp profile really is deleted, and the process really is gone, after `close`.
+`private-mode` pins down anonymity and persistence with a real cookie: set in the
+normal context, survives a reopen there, invisible in the anonymous context, back
+after `anon off`; a cookie and a `localStorage` key surviving a **full browser
+restart** under `--profile-dir`; the launch-flag logic for combinations this
+machine cannot run (root and small-`/dev/shm` on Linux, macOS never getting
+`--no-sandbox`); `--dry-run` launching nothing; and the temp profile really being
+deleted after `close`.
+
+`iframe` runs a page with a nested same-origin frame and a cross-origin one:
+reading, clicking and filling inside a frame, the page coordinates `dom` reports,
+`click-at` taking either page coordinates or frame-relative ones with `--frame`,
+`type-at` replacing instead of appending, and a cross-origin frame failing with
+an explanation.
+
+`robustness` covers the output and environment edges: a screenshot
+whose bytes match its extension and whose relative path means *your* directory;
+`--fast` still sending real input while `--synthetic` says so in the output; a
+`current` tab someone else closed; `bench` running where `ps`/`pgrep` do not
+exist; an explicit `--timeout` not being cut short by `PALMIFER_CMD_BUDGET_MS`;
+`eval --file`; `network detail` by row number; `goto` reporting the URL it
+replaced; log rotation and idle reclamation.
 
 ## Benchmark
 
@@ -242,27 +261,29 @@ generated fixture page (300 rows + a form) with every command pinned to that tab
 
 | command | shim p50 | cli p50 | http p50 | http p90 | sd (shim) |
 |---|---|---|---|---|---|
-| `status` | 43.3 ms | 129.8 ms | 1.9 ms | 2.1 ms | 1.2 |
-| `tabs` | 43.8 ms | 131.6 ms | 1.4 ms | 1.8 ms | 5.0 |
-| `eval 1+1` | 45.9 ms | 133.8 ms | 3.8 ms | 5.3 ms | 2.0 |
-| `text` | 49.4 ms | 135.5 ms | 5.0 ms | 6.5 ms | 1.8 |
-| `snapshot --actionable-only` | 101.0 ms | 187.4 ms | 50.6 ms | 53.2 ms | 5.2 |
-| `snapshot` | 97.3 ms | 184.8 ms | 49.9 ms | 52.8 ms | 2.0 |
-| `screenshot` | 95.0 ms | 184.7 ms | 41.9 ms | 55.7 ms | 4.7 |
+| `status` | 41.7 ms | 129.7 ms | 1.6 ms | 1.9 ms | 1.1 |
+| `tabs` | 41.6 ms | 128.9 ms | 1.2 ms | 1.3 ms | 0.7 |
+| `eval 1+1` | 43.7 ms | 130.5 ms | 2.8 ms | 3.1 ms | 1.1 |
+| `text` | 43.9 ms | 130.0 ms | 2.7 ms | 3.0 ms | 1.2 |
+| `snapshot --actionable-only` | 88.3 ms | 170.8 ms | 41.9 ms | 42.8 ms | 1.9 |
+| `snapshot` | 84.9 ms | 171.2 ms | 42.1 ms | 43.0 ms | 1.1 |
+| `screenshot` | 57.4 ms | 149.2 ms | 27.1 ms | 43.3 ms | 5.4 |
 
 Writes, measured in a separate run with the burst guard lifted (`PALMIFER_ACTION_CAP=10000`), because
 otherwise the guard refuses them and you end up benchmarking the guard:
 
 | action | `--fast` (n=10) | default, paced (n=5) |
 |---|---|---|
-| `fill` a 2-character value | 49.7 ms | 1.20 s |
-| `click` a button | 50.5 ms | 1.18 s |
+| `fill` a 2-character value | 66.7 ms | 1.16 s |
+| `click` a button | 66.6 ms | 1.18 s |
 
 **Reading it.** `http` is the daemon's own round trip with no process spawn, so it is close to the raw CDP
-call: 1.4–5 ms for cheap commands, ~50 ms for an accessibility snapshot. `shim − http` is curl + jq + one
-process (~40 ms); `cli − shim` is Node's startup (~85 ms). **Process startup, not the browser, dominates
+call: 1.2–2.8 ms for cheap commands, ~42 ms for an accessibility snapshot. `shim − http` is curl + jq + one
+process (~40 ms); `cli − shim` is Node's startup (~87 ms). **Process startup, not the browser, dominates
 every call** — which is the only reason `bin/palmifer` exists. Paced writes are the design budget: one
-spacing gap (≥1.2 s), per-character typing (45–140 ms) and an eased pointer path. `--fast` skips the waiting.
+spacing gap (≥1.2 s), per-character typing (45–140 ms) and an eased pointer path. `--fast` skips the waiting
+but still sends real input events, which is why a fast write costs ~67 ms rather than the ~50 ms a synthetic
+`el.click()` would.
 
 **Methodology**, so the numbers can be argued with:
 
@@ -277,15 +298,14 @@ spacing gap (≥1.2 s), per-character typing (45–140 ms) and an eased pointer 
 
 It does not measure network time, page load, or any other tool.
 
-**Stability.** 1200 mixed calls (300 of them `snapshot`, the heaviest read path) in 58 s: **0 failures**.
+**Stability.** 800 mixed calls (160 of them `snapshot`, the heaviest read path) in 107 s: **0 failures**.
 With the daemon started under `--expose-gc`, `palmifer mem` reports memory after a forced collection:
 
 | calls | rss | heapUsed | heapTotal |
 |---|---|---|---|
-| 0 | 60.7 MB | 7.0 MB | 8.9 MB |
-| 400 | 75.1 MB | 8.4 MB | 17.4 MB |
-| 800 | 84.0 MB | 8.4 MB | 23.6 MB |
-| 1200 | 92.7 MB | 8.3 MB | 31.6 MB |
+| 0 | 61.1 MB | 6.7 MB | 11.9 MB |
+| 400 | 71.2 MB | 8.7 MB | 12.6 MB |
+| 800 | 72.6 MB | 8.7 MB | 14.1 MB |
 
 RSS climbs because V8 keeps reserving heap (`heapTotal` grows); the data actually in use stays near 8 MB and
 stops growing. RSS is a high-water mark — check `mem` before calling something a leak.
@@ -304,6 +324,8 @@ palmifer bench --writes-only        # only the write paths (isolated)
 - Loopback only: the daemon binds `127.0.0.1`, requires the token it writes on first run to `~/.cache/palmifer/token`, and rejects non-loopback hosts.
 - While the toggle is on, Chrome shows a "being controlled by automated test software" banner.
 - The throwaway browser's profile lives under the OS temp dir and is deleted by `palmifer browser close`; a profile left behind by a crash is cleaned up on the next start. A `--profile-dir` profile is never deleted — it is yours.
+- A throwaway browser with nothing to do closes itself after 30 minutes (`PALMIFER_PRIVATE_IDLE_MIN`, `0` keeps it). Logs palmifer writes are capped at 2 MB (`PALMIFER_LOG_MAX_BYTES`).
+- When no browser is reachable, `status` still answers — `{"ok":false,"daemon":true,"reachable":false}` — and the next command tells you how to get one back instead of quietly driving your own browser.
 - Anonymous contexts live only as long as Chrome does, and only inside the browser that was current when they were created. Chrome restarting, or a `browser`/`browser use` switch, simply means running `anon on` again.
 - Tab groups are not exposed by CDP; use `close --mine` and tab order.
 
