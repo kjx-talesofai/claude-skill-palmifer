@@ -14,7 +14,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 node_cli="$here/palmifer.mjs"
 PORT="${PALMIFER_DAEMON_PORT:-8798}"
-TOKEN_FILE="${HOME}/.cache/palmifer/token"
+STATE_DIR="${PALMIFER_STATE_DIR:-$HOME/.cache/palmifer}"
+TOKEN_FILE="$STATE_DIR/token"
 orig=("$@")
 
 command -v jq >/dev/null 2>&1 || exec node "$node_cli" "${orig[@]}"
@@ -31,7 +32,7 @@ shift || true
 
 positional=()
 flags='{}'
-VALUED=" tab frame limit max port session filter timeout seconds chrome profile-dir text selector amount times nth js within "
+VALUED=" tab frame limit max port session filter timeout seconds chrome profile-dir text selector amount times nth js within quality scale max-width verify file "
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -54,8 +55,8 @@ if ! curl -s -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
   exec node "$node_cli" "${orig[@]}"
 fi
 
-body=$(jq -nc --arg cmd "$cmd" --argjson flags "$flags" \
-  '{cmd:$cmd, args:$flags, positional:$ARGS.positional}' --args "${positional[@]:-}")
+body=$(jq -nc --arg cmd "$cmd" --argjson flags "$flags" --arg cwd "$PWD" \
+  '{cmd:$cmd, args:$flags, positional:$ARGS.positional, cwd:$cwd}' --args "${positional[@]:-}")
 
 TOKEN="$(cat "$TOKEN_FILE" 2>/dev/null || true)"
 resp=$(curl -s -X POST "http://127.0.0.1:$PORT/run" \

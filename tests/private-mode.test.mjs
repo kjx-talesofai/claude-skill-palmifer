@@ -297,7 +297,12 @@ try {
   const firstRow = Array.isArray(attrs.json) ? attrs.json[0] : null;
   check("dom rows carry attributes (id/data-testid/aria-label)", !!firstRow?.attrs && (firstRow.attrs.id === "lbl" || firstRow.attrs["data-testid"]), JSON.stringify(firstRow));
 
-  const starved = palmiferWithEnv({ PALMIFER_CMD_BUDGET_MS: "700" }, "wait", "--js", "false", "--timeout", "8000");
+  const explicit = palmiferWithEnv({ PALMIFER_CMD_BUDGET_MS: "700" }, "wait", "--js", "false", "--timeout", "1500");
+  check("an explicit --timeout is not cut short by an ambient budget",
+    /wait timed out after 1500ms/.test(explicit.text),
+    explicit.text.slice(0, 200));
+
+  const starved = palmiferWithEnv({ PALMIFER_CMD_BUDGET_MS: "700" }, "wait", "--js", "false");
   check("a command that runs past its budget says which command, which budget, and what to check",
     starved.code !== 0 && /out of its 700ms budget/.test(starved.text) && /palmifer wait/.test(starved.text) && /--front/.test(starved.text),
     starved.text.slice(0, 200));

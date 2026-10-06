@@ -29,6 +29,9 @@
  *                                        (--text keeps the innermost matches; --all for ancestors;
  *                                        rows carry id/data-testid/aria-label/href/role)
  *   click --text <str> [--nth N]         click a control by its label, no selector
+ *   click-at <x> <y>                     trusted click at a point (canvas, icon, frame)
+ *   type-at <x> <y> "<text>" [--append]  click a point, then type there (replaces)
+ *   eval --file <path>                   run a script from disk
  *   screenshot | pdf | network <start|stop|list|detail> | cdp <method> [json]
  *   anon <on|off|status>                 cookie-less context, no logins, no profile
  *   browser [url] [--headed]             start the throwaway browser (headless)
@@ -43,22 +46,34 @@
  *
  * Global flags:
  *   --tab <n|id|substr>      target tab (default: current)
- *   --frame <#fN|id|substr>  operate inside an iframe (see `frames`)
+ *   --frame <#fN|id|substr>  operate inside an iframe (see `frames`); works for
+ *                            snapshot/text/dom/eval/wait/click/fill/upload/click-at/type-at
  *   --actionable-only        snapshot: only clickable/fillable nodes
  *   --filter <regex>         snapshot: only names matching regex
  *   --limit <n>              snapshot: node cap (default 220)
  *   --no-wait                open/goto: return without waiting for load
- *   --timeout <ms>           wait: give up after this (default 15000)
+ *   --timeout <ms>           wait: give up after this (default 15000); raises the
+ *                            command budget to at least --timeout + 5s
  *   --full                   screenshot: full page
- *   --fast                   skip the human pacing (see the pacing section)
+ *   --scale <n>              screenshot: scale the capture
+ *   --max-width <n>          screenshot: shrink to fit this width
+ *   --quality <n>            screenshot: jpeg quality (default 80)
+ *   --annotate               screenshot: draw the @eN numbers from the last snapshot
+ *   --verify <css>           click/fill/press: did it land? ("!.spinner" = gone)
+ *   --fast                   stop waiting (pacing, gaps, typing speed) — never
+ *                            changes the input events themselves
+ *   --synthetic              click/fill: use el.click() / set .value instead of real
+ *                            input; pages that check event.isTrusted will ignore it
  *   --text <str>             wait/click/dom: match by visible text (pierces shadow roots)
  *   --js <expr>              wait: poll an expression until it is truthy
- *   --amount <px> --times N  scroll: how far, how often (bottom/top repeat until it stops)
+ *   --amount <px> --times N  scroll: how far (pixels), how often
  *   --nth <n>                click: which match to use, for CSS and --text (default 1)
  *   --exact                  text matching must be the whole label
  *   --within <css>           dom/click --text: only look inside this container
  *   --allow-network          eval: silence the "this talks to the network" warning
- *   --front                  scroll/click/fill/press: raise the tab if it is hidden
+ *   --front                  scroll/click/fill/press/click-at/type-at: raise a hidden tab
+ *   --append                 type-at: add to what is there instead of replacing it
+ *   --file <path>            eval: read the script from this file
  *   --headed                 browser: visible window instead of headless
  *   --profile-dir <dir>      browser: keep the profile here (logins survive)
  *   --dry-run                browser: print the command line, launch nothing
@@ -74,6 +89,9 @@
  *   PALMIFER_ACTION_CAP      burst cap per 10 min (default 80)
  *   PALMIFER_DAEMON_PORT     default 8798
  *   PALMIFER_STATE_DIR       default ~/.cache/palmifer
+ *   PALMIFER_PRIVATE_IDLE_MIN  close a throwaway browser after this many idle
+ *                            minutes (default 30, 0 keeps it)
+ *   PALMIFER_LOG_MAX_BYTES   rotate we-wrote-it logs past this size (default 2 MB)
  *   PALMIFER_CMD_BUDGET_MS   per-command timeout before a CDP call is declared stuck
  *                            (defaults: 20s cheap, 60s slow, wait uses --timeout+5s)
  */
@@ -91,7 +109,7 @@ import {
 } from "node:fs";
 import { randomBytes, createHash } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
-import { join, dirname, delimiter, resolve } from "node:path";
+import { join, dirname, delimiter, resolve, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromeLaunchFlags, shmSizeMb, sandboxUnavailable } from "./launch-flags.mjs";
 import { spawn } from "node:child_process";
@@ -173,6 +191,11 @@ const VALUED = new Set([
   "nth",
   "js",
   "within",
+  "quality", // screenshot --quality N (jpeg only)
+  "scale", // screenshot --scale N
+  "max-width", // screenshot --max-width N
+  "verify", // click/fill --verify <css>
+  "file", // eval --file <path>
 ]);
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
@@ -196,6 +219,52 @@ function fail(msg, code = 1) {
   console.error(msg);
   process.exit(code);
 }
+// ---------------------------------------------------------------- output paths
+//
+// Files are written by the daemon, but "shot.png" means the directory the CALLER
+// is in — two different places as soon as the daemon was started elsewhere. The
+// client sends its cwd with every request, and the extension decides the format
+// so the bytes always match the name.
+
+let clientCwd = ""; // set per request from the client's cwd
+let lastCommandAt = 0; // last time the daemon was asked to do anything
+
+function expandHome(p) {
+  return p === "~" || p.startsWith("~/") ? join(homedir(), p.slice(1)) : p;
+}
+
+/**
+ * Absolute output path, with the extension forced to match what will be written:
+ * a .png holding JPEG bytes is a file no image reader will open.
+ */
+function resolveOutputPath(given, allowedExts, fallbackExt) {
+  if (!given) return join(tmpdir(), `palmifer-${Date.now()}${fallbackExt}`);
+  const p = resolve(clientCwd || process.cwd(), expandHome(given));
+  const ext = extname(p).toLowerCase();
+  if (allowedExts.includes(ext)) return p;
+  return (ext ? p.slice(0, -ext.length) : p) + fallbackExt;
+}
+
+const IMAGE_FORMATS = { ".png": "png", ".jpg": "jpeg", ".jpeg": "jpeg", ".webp": "webp" };
+
+/**
+ * Chrome writes a steady trickle of its own log lines — GCM retries, display-link
+ * warnings — into the file we redirect it to. A headless instance left up for
+ * days produced 177 KB of it. Cap it instead of letting it grow without bound.
+ */
+const LOG_MAX_BYTES = Number(process.env.PALMIFER_LOG_MAX_BYTES || 2 * 1024 * 1024);
+
+function rotateLog(file) {
+  try {
+    const size = statSync(file).size;
+    if (size <= LOG_MAX_BYTES) return;
+    writeFileSync(file, `--- rotated at ${new Date().toISOString()}, previous size ${size} bytes ---\n`);
+  } catch {
+    // No file yet, or no permission: the log is a debugging aid, never a reason
+    // to fail the command that is starting.
+  }
+}
+
 function printHelp() {
   const doc = readFileSync(SELF, "utf8");
   console.log(doc.split("/**")[1].split("*/")[0].replace(/^ \* ?/gm, "").trim());
@@ -242,6 +311,55 @@ function privateBrowser() {
 }
 const activeMode = () => ((readJson(MODE_FILE) || {}).mode === "private" ? "private" : "real");
 const setMode = (mode) => writeJson(MODE_FILE, { mode });
+
+/**
+ * A throwaway browser is cheap to start and easy to forget: one left up for two
+ * days held a temp profile and 177 KB of Chrome's own log lines. Reclaim it once
+ * nothing has asked for it for a while. The mode is deliberately left alone — a
+ * caller that comes back later should be told its browser is gone, not be
+ * silently pointed at the user's real one.
+ */
+function idleReclaimMs() {
+  const minutes = Number(process.env.PALMIFER_PRIVATE_IDLE_MIN ?? 30);
+  return Number.isFinite(minutes) && minutes > 0 ? minutes * 60_000 : 0;
+}
+
+async function stopPrivateProcess() {
+  const p = readJson(PRIVATE_FILE);
+  if (!p) return false;
+  if (p.pid && pidAlive(p.pid)) {
+    // Detached, so the pid leads a process group: one signal reaps the helpers too.
+    try {
+      process.kill(-p.pid, "SIGTERM");
+    } catch {
+      try {
+        process.kill(p.pid, "SIGTERM");
+      } catch {}
+    }
+    for (let i = 0; i < 30 && pidAlive(p.pid); i++) await sleep(100);
+    if (pidAlive(p.pid)) {
+      try {
+        process.kill(-p.pid, "SIGKILL");
+      } catch {
+        try {
+          process.kill(p.pid, "SIGKILL");
+        } catch {}
+      }
+    }
+  }
+  // Only ever delete a directory we created for this throwaway; `--profile-dir`
+  // profiles hold the user's logins and are never touched.
+  if (!p.persistent && typeof p.profileDir === "string" && p.profileDir.includes("palmifer-private-")) {
+    try {
+      rmSync(p.profileDir, { recursive: true, force: true });
+    } catch {}
+  }
+  rmSync(PRIVATE_FILE, { force: true });
+  resetConn();
+  delete state.anonContexts.private;
+  forgetTabs();
+  return true;
+}
 
 /**
  * Tabs and @e refs belong to one browser; carrying them across a switch would
@@ -343,7 +461,10 @@ function resolveEndpoint() {
   if (activeMode() === "private") {
     const priv = privateBrowser();
     if (priv) return priv.endpoint;
-    setMode("real"); // it is gone; fall back instead of failing confusingly
+    // Gone: crashed, killed elsewhere, or closed after idling. Handing back the
+    // user's endpoint would retarget this command at the tabs they are working
+    // in, so answer "no browser" and let the caller explain what to do.
+    return "";
   }
   return realEndpoint();
 }
@@ -476,8 +597,8 @@ async function typeText(cdp, sessionId, text) {
 }
 
 /** The default click: real input events, human pointer path, paced. */
-async function trustedClick(cdp, sessionId, sel) {
-  return trustedClickAt(cdp, sessionId, await elementRect(cdp, sessionId, sel));
+async function trustedClick(cdp, sessionId, sel, ft = null) {
+  return trustedClickAt(cdp, sessionId, await elementRect(cdp, sessionId, sel, ft));
 }
 
 /**
@@ -590,7 +711,11 @@ function budgetFor(name, requestedByClient = 0) {
   // The daemon is long-lived: its own environment was captured at start-up, so
   // a budget the user exports later only works if the client sends it along.
   const override = Number(requestedByClient || process.env.PALMIFER_CMD_BUDGET_MS || 0);
-  if (override > 0) return override;
+  // An explicit --timeout is a request for patience, and patience must not be cut
+  // short by a budget that was set for some other purpose.
+  const asked = Number(args.timeout);
+  const waitFloor = name === "wait" && Number.isFinite(asked) && asked > 0 ? asked + 5000 : 0;
+  if (override > 0) return Math.max(override, waitFloor);
   if (name === "wait") return Number(args.timeout || 15000) + 5000;
   if (["scroll", "open", "goto", "browser", "bench", "upload", "screenshot", "pdf"].includes(name)) return 60000;
   return 20000;
@@ -716,7 +841,21 @@ async function resolveTabInner(cdp) {
   }
   const byUrl = pages.find((t) => t.url.includes(want) || t.title.includes(want));
   if (byUrl) return byUrl;
-  fail(`no tab matching "${want}"`);
+  // The implicit current tab is shared state: the user closes tabs and a second
+  // agent switches them. A dead pointer must not turn every later command into a
+  // failure, so fall back to a live tab — loudly. An explicit --tab that does not
+  // resolve is still an error: acting on a different tab than the one asked for
+  // would be worse than stopping.
+  if (!args.tab && state.current) {
+    state.current = pages[0].targetId;
+    saveState(state);
+    console.error(
+      `· the tab current pointed at is gone; fell back to "${(pages[0].title || pages[0].url).slice(0, 60)}".\n` +
+        "  Run `palmifer tabs` and `palmifer use <n>` to choose deliberately.",
+    );
+    return pages[0];
+  }
+  fail(`no tab matching "${want}" — run \`palmifer tabs\` then \`palmifer use <n>\``);
 }
 
 async function resolveTab(cdp) {
@@ -793,7 +932,7 @@ async function resolveFrame(cdp, sessionId) {
 }
 
 /** Execution context of a frame, needed to evaluate inside it. */
-async function frameContext(cdp, sessionId, frameId) {
+async function frameContextOnce(cdp, sessionId, frameId) {
   const seen = [];
   const off = cdp.on("Runtime.executionContextCreated", (p, sid) => {
     if (sid === sessionId) seen.push(p.context);
@@ -817,8 +956,177 @@ async function frameContext(cdp, sessionId, frameId) {
   }
 }
 
+/**
+ * A frame's context. Frames come and go with SPA routing — the shell page swaps
+ * an iframe's `src` on every route change — so a lookup that misses once is
+ * usually a frame that is mid-navigation, not a frame that cannot be reached.
+ */
+async function frameContext(cdp, sessionId, frameId) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const ctx = await frameContextOnce(cdp, sessionId, frameId);
+    if (ctx) return ctx;
+    await sleep(200 * (attempt + 1));
+  }
+  return null;
+}
+
+/** The frame named by --frame, its context, and (later) its offset. */
+async function frameTarget(cdp, sessionId) {
+  const frame = await resolveFrame(cdp, sessionId);
+  if (!frame) return null;
+  const ctx = await frameContext(cdp, sessionId, frame.id);
+  if (!ctx) {
+    fail(
+      `no execution context for frame ${frame.url || frame.id}.\n` +
+        "  The frame may be navigating — retry, or pass a different `--frame` (`palmifer frames` lists them).",
+    );
+  }
+  if (ctx.isolated) {
+    console.log("# frame has no default realm; evaluated in an isolated world (page globals are not visible)");
+  }
+  return { frame, contextId: ctx.contextId };
+}
+
+// Frames nest: an element's point inside a frame is only usable once every
+// enclosing frame's position is added. `window.frameElement` gives that the
+// short way round — one expression in the innermost frame walks itself out.
+const FRAME_OFFSET_JS = `(()=>{let x=0,y=0,w=window;
+  while(w!==w.top){
+    let el=null; try{ el=w.frameElement }catch(e){ return null }
+    if(!el) return null;
+    const r=el.getBoundingClientRect(), cs=getComputedStyle(el);
+    x+=r.left+parseFloat(cs.borderLeftWidth||0)+parseFloat(cs.paddingLeft||0);
+    y+=r.top+parseFloat(cs.borderTopWidth||0)+parseFloat(cs.paddingTop||0);
+    w=w.parent;
+  }
+  return {x,y}})()`;
+
+async function frameOffset(cdp, sessionId, ft) {
+  const off = await evaluate(cdp, sessionId, FRAME_OFFSET_JS, ft.contextId);
+  if (!off) {
+    fail(
+      `frame ${ft.frame.url || ft.frame.id} is cross-origin, so its position on the page cannot be measured.\n` +
+        "  Read it with `--frame` (snapshot/text/eval) and act with `cdp Input.dispatchMouseEvent`," +
+        " or use a same-origin frame.",
+    );
+  }
+  return off;
+}
+
+/**
+ * A cheap fingerprint of the page around an action. "Did that do anything?" is
+ * the question every caller asks straight after a click, and answering it with a
+ * second command doubles the calls and the turns. These numbers are deliberately
+ * raw — on a virtualised list the DOM changes on every scroll — so they are
+ * signals, not a verdict.
+ */
+const PAGE_SIG_JS = `(()=>{let url='';try{url=(window.top===window?location:window.top.location).href}catch(e){url=location.href}
+  return {url,nodes:document.getElementsByTagName('*').length,title:document.title||''}})()`;
+
+async function pageSignature(cdp, sessionId, ft) {
+  const sig = await evaluate(cdp, sessionId, PAGE_SIG_JS, ft ? ft.contextId : undefined).catch(() => null);
+  return sig || { url: "", nodes: 0, title: "" };
+}
+
+/**
+ * --verify <css> answers "is it there now?", polling because several sites settle
+ * a beat after the click. A leading "!" asks for the opposite: the thing is gone.
+ */
+async function verifySelector(cdp, sessionId, spec, ft, timeoutMs = 2000) {
+  const absent = spec.startsWith("!");
+  const selector = absent ? spec.slice(1) : spec;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const found = await evaluate(cdp, sessionId, `!!document.querySelector(${JSON.stringify(selector)})`, ft ? ft.contextId : undefined).catch(() => false);
+    if (found !== absent) return true;
+    if (Date.now() >= deadline) return false;
+    await sleep(120);
+  }
+}
+
+/**
+ * Draw the `@eN` numbers from the last snapshot onto the page, so a screenshot
+ * and a snapshot are read with the same labels. Removed again straight after the
+ * capture; the page is left exactly as it was found.
+ */
+async function annotateRefs(cdp, sessionId, limit = 80) {
+  const entries = Object.entries(state.refs || {}).slice(0, limit);
+  if (!entries.length) return { count: 0, remove: async () => {} };
+  const [sx, sy] = (await evaluate(cdp, sessionId, "[Math.round(scrollX), Math.round(scrollY)]").catch(() => [0, 0])) || [0, 0];
+  const boxes = [];
+  for (const [ref, backendNodeId] of entries) {
+    try {
+      const { model } = await cdp.send("DOM.getBoxModel", { backendNodeId }, sessionId);
+      const c = model.content;
+      const x = c[0] + sx;
+      const y = c[1] + sy;
+      const w = c[2] - c[0];
+      const h = c[5] - c[1];
+      if (w < 1 || h < 1) continue;
+      boxes.push({ label: ref.replace("@e", ""), x: Math.round(x), y: Math.round(y), w: Math.round(w), h: Math.round(h) });
+    } catch {
+      // A ref captured in a frame has frame-local geometry; skip it rather than
+      // draw a box in the wrong place.
+    }
+  }
+  if (!boxes.length) return { count: 0, remove: async () => {} };
+  const count = await evaluate(
+    cdp,
+    sessionId,
+    `(()=>{const old=document.getElementById('__palm_annot');if(old)old.remove();
+      const box=document.createElement('div');box.id='__palm_annot';
+      box.style.cssText='position:absolute;left:0;top:0;z-index:2147483647;pointer-events:none';
+      for(const b of ${JSON.stringify(boxes)}){
+        const d=document.createElement('div');
+        d.style.cssText='position:absolute;left:'+b.x+'px;top:'+b.y+'px;width:'+b.w+'px;height:'+b.h+'px;border:2px solid #ff2d55;box-sizing:border-box';
+        const l=document.createElement('span');
+        l.textContent=b.label;
+        l.style.cssText='position:absolute;left:-2px;top:-14px;background:#ff2d55;color:#fff;font:10px/13px monospace;padding:0 3px;border-radius:3px';
+        d.appendChild(l);box.appendChild(d);
+      }
+      document.documentElement.appendChild(box);return ${boxes.length}})()`,
+  );
+  const remove = () => evaluate(cdp, sessionId, "(()=>{const b=document.getElementById('__palm_annot');if(b)b.remove();return true})()");
+  return { count: Number(count) || 0, remove };
+}
+
+/** Run an action and report what changed around it. */async function withEffect(cdp, sessionId, ft, action) {
+  const requestsBefore = net ? net.requests.size : null;
+  const before = await pageSignature(cdp, sessionId, ft);
+  const value = await action();
+  const after = await pageSignature(cdp, sessionId, ft);
+  const effect = {
+    urlChanged: before.url !== after.url,
+    titleChanged: before.title !== after.title,
+    domDelta: after.nodes - before.nodes,
+  };
+  if (requestsBefore !== null) effect.requests = net.requests.size - requestsBefore;
+  if (args.verify) effect.verified = await verifySelector(cdp, sessionId, String(args.verify), ft);
+  return { value, effect };
+}
+
+/** Select what is already in the focused control, so typing replaces it. */
+const SELECT_ALL_JS = `(()=>{const el=document.activeElement;if(!el)return false;
+  if(el.select){el.select();return true}
+  if(el.isContentEditable){const r=document.createRange();r.selectNodeContents(el);
+    const s=getSelection();s.removeAllRanges();s.addRange(r);return true}
+  return false})()`;
+
+/**
+ * A point given by the caller: viewport coordinates as CDP uses them, or frame
+ * coordinates when --frame says which viewport they were measured in.
+ */
+async function pointFrom(cdp, sessionId, x, y) {
+  if (!Number.isFinite(x) || !Number.isFinite(y)) fail("coordinates must be numbers: <x> <y>");
+  const ft = await frameTarget(cdp, sessionId);
+  if (!ft) return { x, y, frame: null };
+  const off = await frameOffset(cdp, sessionId, ft);
+  return { x: x + off.x, y: y + off.y, frame: ft.frame.url || ft.frame.id };
+}
+
 /** Centre of an element in viewport coordinates (for trusted input). */
-async function elementRect(cdp, sessionId, sel) {
+async function elementRect(cdp, sessionId, sel, ft = null) {
+  const contextId = ft ? ft.contextId : undefined;
   if (!sel.startsWith("@e")) {
     // Resolve and measure in ONE call: SPA lists re-render between two calls and
     // a marker attribute would be wiped before the second round trip.
@@ -838,6 +1146,7 @@ async function elementRect(cdp, sessionId, sel) {
           el.scrollIntoView({block:'center'});const r=el.getBoundingClientRect();
           return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height})})()`,
         returnByValue: true,
+        ...(contextId ? { contextId } : {}),
       },
       sessionId,
     );
@@ -851,6 +1160,11 @@ async function elementRect(cdp, sessionId, sel) {
     if (rect.w < 2 || rect.h < 2) {
       fail(`selector matched a zero-size element (${rect.w}x${rect.h}): ${sel} — target a visible one`);
     }
+    if (ft) {
+      const off = await frameOffset(cdp, sessionId, ft);
+      rect.x += off.x;
+      rect.y += off.y;
+    }
     return rect;
   }
   const backendNodeId = state.refs[sel];
@@ -861,12 +1175,19 @@ async function elementRect(cdp, sessionId, sel) {
     {
       objectId: object.objectId,
       functionDeclaration:
-        "function(){this.scrollIntoView({block:'center'});const r=this.getBoundingClientRect();return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2})}",
+        "function(){this.scrollIntoView({block:'center'});const r=this.getBoundingClientRect();return JSON.stringify({x:r.left+r.width/2,y:r.top+r.height/2,w:r.width,h:r.height})}",
       returnByValue: true,
     },
     sessionId,
   );
-  return JSON.parse(result.value);
+  const rect = JSON.parse(result.value);
+  // A ref captured inside a frame carries frame-local coordinates.
+  if (ft) {
+    const off = await frameOffset(cdp, sessionId, ft);
+    rect.x += off.x;
+    rect.y += off.y;
+  }
+  return rect;
 }
 
 // ---------------------------------------------------------------- network capture (daemon memory)
@@ -955,14 +1276,14 @@ const DEEP_JS = `
 `;
 
 /** Click target found by its visible text, through shadow roots. */
-async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false, within = null } = {}) {
+async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false, within = null } = {}, ft = null) {
   const expr = `(()=>{${DEEP_JS}
     const scope=${within ? `__palmScope(${JSON.stringify(String(within))})` : "null"};
     if(${within ? "true" : "false"} && !scope) return JSON.stringify({error:"--within matched nothing"});
     const p=__palmPick(${JSON.stringify(String(want))},${exact ? "true" : "false"},${Number(nth) || 1},scope);
     if(!p) return null;
     return JSON.stringify(p)})()`;
-  const raw = await evaluate(cdp, sessionId, expr);
+  const raw = await evaluate(cdp, sessionId, expr, ft ? ft.contextId : undefined);
   if (!raw) {
     fail(
       `no visible element with text ${exact ? "exactly " : ""}"${want}" — ` +
@@ -972,11 +1293,16 @@ async function elementRectByText(cdp, sessionId, want, { nth = 1, exact = false,
   const rect = JSON.parse(raw);
   if (rect.error) fail(`${rect.error} — check the container selector with \`palmifer dom <sel>\``);
   if (rect.w < 2 || rect.h < 2) fail(`text "${want}" matched a zero-size element: ${rect.tag}.${rect.cls}`);
+  if (ft) {
+    const off = await frameOffset(cdp, sessionId, ft);
+    rect.x += off.x;
+    rect.y += off.y;
+  }
   return rect;
 }
 
 /** Elements matching a CSS selector or text, shadow roots included. */
-async function deepQuery(cdp, sessionId, { selector = null, text = null, exact = false, limit = 20, within = null, all = false }) {
+async function deepQuery(cdp, sessionId, { selector = null, text = null, exact = false, limit = 20, within = null, all = false }, ft = null) {
   const expr = `(()=>{${DEEP_JS}
     const rows=[];
     const scope=${within ? `__palmScope(${JSON.stringify(String(within))})` : "null"};
@@ -995,8 +1321,15 @@ async function deepQuery(cdp, sessionId, { selector = null, text = null, exact =
         rows.push({tag:h.tag,cls:h.cls,attrs:__palmAttrs(h.el),text:h.text,interactive:h.interactive,shadow:!!h.el.getRootNode().host,
           x:Math.round(h.x),y:Math.round(h.y),w:Math.round(h.w),h:Math.round(h.h)}) } }
     return JSON.stringify(rows.slice(0,${Number(limit) || 20}))})()`;
-  const raw = await evaluate(cdp, sessionId, expr);
-  return JSON.parse(raw || "[]");
+  const raw = await evaluate(cdp, sessionId, expr, ft ? ft.contextId : undefined);
+  const rows = JSON.parse(raw || "[]");
+  // Report page coordinates even when the probe ran inside a frame, so a row can
+  // be fed straight to `click-at`.
+  if (ft && rows.length) {
+    const off = await frameOffset(cdp, sessionId, ft);
+    for (const r of rows) { if (typeof r.x === "number") { r.x += off.x; r.y += off.y; } }
+  }
+  return rows;
 }
 
 // ---------------------------------------------------------------- keyboard
@@ -1061,23 +1394,43 @@ function keySpec(spec) {
 
 const commands = {
   async status() {
-    const cdp = await getConn();
-    const v = await cdp.send("Browser.getVersion");
-    const pages = await pageTargets(cdp);
-    const anon = await anonContext(cdp);
-    out({
-      ok: true,
-      mode: activeMode(),
-      endpoint: resolveEndpoint(),
-      browser: v.product,
-      protocol: v.protocolVersion,
-      tabs: pages.length,
-      anonContext: anon,
-      current: state.current,
-      openedByMe: pruneOpened(pages).length,
-      networkCapturing: !!net,
-      daemon: true,
-    });
+    // `status` is the first thing anyone runs when something is wrong, so it
+    // must answer even when the browser is not there — a status that dies says
+    // nothing about which half is broken.
+    const base = { mode: activeMode(), endpoint: resolveEndpoint(), daemon: true };
+    let cdp;
+    try {
+      cdp = await getConn();
+      const v = await cdp.send("Browser.getVersion");
+      const pages = await pageTargets(cdp);
+      const anon = await anonContext(cdp);
+      out({
+        ok: true,
+        ...base,
+        browser: v.product,
+        protocol: v.protocolVersion,
+        tabs: pages.length,
+        anonContext: anon,
+        // Report the tab that would actually be used. A dead pointer is not
+        // "current" — showing it sends whoever is debugging down the wrong path.
+        current: pages.some((t) => t.targetId === state.current) ? state.current : null,
+        currentStale:
+          state.current && !pages.some((t) => t.targetId === state.current)
+            ? { id: state.current, note: "the next command falls back to a live tab and says so" }
+            : null,
+        openedByMe: pruneOpened(pages).length,
+        networkCapturing: !!net,
+      });
+    } catch (e) {
+      out({
+        ok: false,
+        ...base,
+        browser: null,
+        reachable: false,
+        note: `${String(e.message || e).split("\n")[0]} — the daemon is fine; the browser is not answering`,
+        ...(activeMode() === "private" ? { next: "`palmifer browser <url>` starts a fresh throwaway browser" } : {}),
+      });
+    }
   },
 
   async tabs() {
@@ -1156,13 +1509,17 @@ const commands = {
     if (!url) fail("usage: palmifer goto <url>");
     noteHost(url);
     return withTab(async (cdp, sessionId, target) => {
+      // Navigation replaces whatever that tab was showing, and "current" is shared
+      // with every other caller. Report what was replaced so a stray `goto` is
+      // visible in the output instead of only in the wreckage.
+      const previousUrl = target.url;
       await cdp.send("Page.navigate", { url }, sessionId);
       if (args["no-wait"]) {
         state.current = target.targetId;
         state.refs = {};
         state.refsTab = null;
         saveState(state);
-        out({ tab: target.targetId, url, waited: false });
+        out({ tab: target.targetId, url, previousUrl, waited: false });
         return;
       }
       await waitReady(cdp, sessionId);
@@ -1176,7 +1533,7 @@ const commands = {
       saveState(state);
       await cdp.send("Target.detachFromTarget", { sessionId: fresh }).catch(() => {});
       await dwell(800, 1800);
-      out({ tab: target.targetId, url: final });
+      out({ tab: target.targetId, url: final, previousUrl });
     });
   },
 
@@ -1248,21 +1605,27 @@ const commands = {
   async text() {
     const max = Number(args.max || 6000);
     return withTab(async (cdp, sessionId, target) => {
-      const frame = await resolveFrame(cdp, sessionId);
+      const ft = await frameTarget(cdp, sessionId);
       const expr = `document.body ? document.body.innerText.replace(/\\n{3,}/g,'\\n\\n').slice(0,${max}) : ''`;
-      let t;
-      if (frame) {
-        const c = await frameContext(cdp, sessionId, frame.id);
-        t = c ? await evaluate(cdp, sessionId, expr, c.contextId) : "";
-      } else {
-        t = await evaluate(cdp, sessionId, expr);
-      }
+      const t = ft
+        ? await evaluate(cdp, sessionId, expr, ft.contextId)
+        : await evaluate(cdp, sessionId, expr);
       console.log(`# ${target.title}\n${t}`);
     });
   },
 
   async eval([code]) {
-    if (!code) fail("usage: palmifer eval '<js>'");
+    if (args.file) {
+      // Extraction scripts are long and full of quotes; writing them to a file is
+      // the only way to keep them readable and out of shell-escaping trouble.
+      const p = resolve(clientCwd || process.cwd(), expandHome(String(args.file)));
+      try {
+        code = readFileSync(p, "utf8");
+      } catch (e) {
+        fail(`cannot read --file ${p}: ${e.message}`);
+      }
+    }
+    if (!code) fail("usage: palmifer eval '<js>' | eval --file <path>");
     if (!args["allow-network"] && /\b(fetch|XMLHttpRequest|sendBeacon|WebSocket)\s*\(/.test(code)) {
       console.error(
         "· this eval talks to the network. palmifer exists to drive the page; read the rendered\n" +
@@ -1271,18 +1634,10 @@ const commands = {
       );
     }
     return withTab(async (cdp, sessionId) => {
-      const frame = await resolveFrame(cdp, sessionId);
-      let v;
-      if (frame) {
-        const c = await frameContext(cdp, sessionId, frame.id);
-        if (!c) fail(`no execution context for frame ${frame.url || frame.id}`);
-        if (c.isolated) {
-          console.log("# frame has no default realm; evaluated in an isolated world (page globals are not visible)");
-        }
-        v = await evaluate(cdp, sessionId, code, c.contextId);
-      } else {
-        v = await evaluate(cdp, sessionId, code);
-      }
+      const ft = await frameTarget(cdp, sessionId);
+      const v = ft
+        ? await evaluate(cdp, sessionId, code, ft.contextId)
+        : await evaluate(cdp, sessionId, code);
       out(typeof v === "string" ? v : JSON.stringify(v));
     });
   },
@@ -1293,8 +1648,7 @@ const commands = {
     const wantText = args.text ? String(args.text) : null;
     const wantJs = args.js ? String(args.js) : null;
     return withTab(async (cdp, sessionId) => {
-      const frame = await resolveFrame(cdp, sessionId);
-      const ctx = frame ? await frameContext(cdp, sessionId, frame.id) : null;
+      const ctx = await frameTarget(cdp, sessionId);
       const deadline = Date.now() + timeout;
       // --js is the escape hatch for "wait until the page has N of something",
       // which is what a lazy-loaded SPA list actually needs. Text and CSS
@@ -1333,6 +1687,7 @@ const commands = {
     const text = args.text ? String(args.text) : null;
     if (!selector && !text) fail("usage: palmifer dom <css> | dom --text <str> [--exact] [--limit N]");
     return withTab(async (cdp, sessionId, t) => {
+      const ft = await frameTarget(cdp, sessionId);
       const rows = await deepQuery(cdp, sessionId, {
         selector,
         text,
@@ -1340,7 +1695,7 @@ const commands = {
         limit: Number(args.limit || 20),
         within: args.within ? String(args.within) : null,
         all: !!args.all,
-      });
+      }, ft);
       if (rows.length && rows[0].error) fail(`selector threw: ${rows[0].error}`);
       out(rows.length ? rows : { matched: 0, note: `nothing matched ${text ? `text "${text}"` : selector} (shadow roots included)` });
     });
@@ -1392,43 +1747,52 @@ const commands = {
 
   async click([sel]) {
     if (!sel && !args.text) fail("usage: palmifer click <selector|@eN> [--nth N] | click --text <label> [--nth N]");
-    if (args.frame) fail("--frame is supported by snapshot/text/eval/wait; click acts on the top document");
     return withTab(async (cdp, sessionId, target) => {
       await paceAction();
+      const ft = await frameTarget(cdp, sessionId);
       if (args.text) {
         // Click the thing by what it says. On a page whose controls are JS
         // buttons with no href this is the only honest handle, and the two
         // calls below find it through shadow roots.
-        const rect = await elementRectByText(cdp, sessionId, String(args.text), {
-          nth: Number(args.nth || 1),
-          exact: !!args.exact,
-          within: args.within ? String(args.within) : null,
+        const { value: rect, effect } = await withEffect(cdp, sessionId, ft, async () => {
+          const r = await elementRectByText(cdp, sessionId, String(args.text), {
+            nth: Number(args.nth || 1),
+            exact: !!args.exact,
+            within: args.within ? String(args.within) : null,
+          }, ft);
+          await trustedClickAt(cdp, sessionId, r);
+          return r;
         });
-        await trustedClickAt(cdp, sessionId, rect);
         out({
           clickedByText: String(args.text),
           what: `${rect.tag}${rect.cls ? "." + rect.cls.split(" ")[0] : ""}: ${rect.text}`,
           candidates: rect.candidates,
           interactive: rect.interactive,
           trusted: true,
+          input: "real",
           at: { x: Math.round(rect.x), y: Math.round(rect.y) },
+          effect,
         });
         return;
       }
       if (sel.startsWith("@e") && state.refsTab && state.refsTab !== target.targetId) {
         fail("@e refs were captured on another tab — run snapshot on this tab");
       }
-      if (args.trusted || isHuman() || args.nth || args.within) {
-        // Real input events: pages that check event.isTrusted ignore el.click(),
-        // and an eased pointer path is what the user's own hand looks like.
-        // --nth/--within are positional, so they always resolve to a point.
-        const rect = await trustedClick(cdp, sessionId, sel);
+      if (!args.synthetic || args.trusted) {
+        // Real input events, always — it is the only kind a page that checks
+        // event.isTrusted will act on, and a click that silently does nothing is
+        // the most expensive failure this tool can produce. --fast drops the
+        // waiting around it (pointer path, gaps, per-character typing), never the
+        // events themselves; --synthetic is the explicit opt-in for the shortcut.
+        const { value: rect, effect } = await withEffect(cdp, sessionId, ft, () => trustedClick(cdp, sessionId, sel, ft));
         out({
           clicked: sel,
           nth: Math.max(1, Number(args.nth || 1)),
           trusted: true,
+          input: "real",
           human: isHuman(),
           at: { x: Math.round(rect.x), y: Math.round(rect.y) },
+          effect,
         });
         return;
       }
@@ -1436,53 +1800,111 @@ const commands = {
         const backendNodeId = state.refs[sel];
         if (!backendNodeId) fail(`unknown ref ${sel} — run snapshot first`);
         const { object } = await cdp.send("DOM.resolveNode", { backendNodeId }, sessionId);
-        const res = await cdp.send(
-          "Runtime.callFunctionOn",
-          {
-            objectId: object.objectId,
-            functionDeclaration:
-              "function(){this.scrollIntoView({block:'center'});this.click();return this.tagName+':'+(this.innerText||this.value||'').slice(0,40)}",
-            returnByValue: true,
-          },
-          sessionId,
-        );
-        out({ clicked: sel, what: res.result?.value });
+        const { value: what, effect } = await withEffect(cdp, sessionId, ft, async () => {
+          const res = await cdp.send(
+            "Runtime.callFunctionOn",
+            {
+              objectId: object.objectId,
+              functionDeclaration:
+                "function(){this.scrollIntoView({block:'center'});this.click();return this.tagName+':'+(this.innerText||this.value||'').slice(0,40)}",
+              returnByValue: true,
+            },
+            sessionId,
+          );
+          return res.result?.value;
+        });
+        out({ clicked: sel, what, trusted: false, input: "synthetic", effect });
       } else {
-        const v = await evaluate(
-          cdp,
-          sessionId,
-          `(()=>{const el=document.querySelector(${JSON.stringify(sel)});if(!el)return 'NOT_FOUND';el.scrollIntoView({block:'center'});el.click();return el.tagName+':'+(el.innerText||el.value||'').slice(0,40)})()`,
-        );
-        out({ clicked: sel, what: v });
+        const { value: what, effect } = await withEffect(cdp, sessionId, ft, () =>
+          evaluate(
+            cdp,
+            sessionId,
+            `(()=>{const el=document.querySelector(${JSON.stringify(sel)});if(!el)return 'NOT_FOUND';el.scrollIntoView({block:'center'});el.click();return el.tagName+':'+(el.innerText||el.value||'').slice(0,40)})()`,
+            ft ? ft.contextId : undefined,
+          ));
+        out({ clicked: sel, what, trusted: false, input: "synthetic", effect });
       }
+    });
+  },
+
+  /**
+   * Act at a point. Plenty of controls cannot be reached by selector at all —
+   * a canvas, an icon-only button, anything drawn inside a frame palmifer
+   * cannot query — and a point is then the honest handle. Coordinates are
+   * viewport coordinates; with --frame they are relative to that frame.
+   */
+  async "click-at"([x, y]) {
+    if (x === undefined || y === undefined) fail("usage: palmifer click-at <x> <y> [--frame #fN]");
+    return withTab(async (cdp, sessionId) => {
+      await paceAction();
+      const ft = await frameTarget(cdp, sessionId);
+      const p = await pointFrom(cdp, sessionId, Number(x), Number(y));
+      const { effect } = await withEffect(cdp, sessionId, ft, () => trustedClickAt(cdp, sessionId, p));
+      out({
+        clickedAt: { x: Math.round(p.x), y: Math.round(p.y) },
+        ...(p.frame ? { frame: p.frame } : {}),
+        trusted: true,
+        input: "real",
+        effect,
+      });
+    });
+  },
+
+  async "type-at"([x, y, ...words]) {
+    const text = words.join(" ");
+    if (x === undefined || y === undefined || !words.length) {
+      fail('usage: palmifer type-at <x> <y> "<text>" [--append] [--frame #fN]');
+    }
+    return withTab(async (cdp, sessionId) => {
+      await paceAction();
+      const ft = await frameTarget(cdp, sessionId);
+      const p = await pointFrom(cdp, sessionId, Number(x), Number(y));
+      const { effect } = await withEffect(cdp, sessionId, ft, async () => {
+        await trustedClickAt(cdp, sessionId, p);
+        // Typing into a field that already has content means replacing it: that is
+        // what a person does, and an accidental append produced 155+140 characters
+        // in the field once already.
+        if (!args.append) await evaluate(cdp, sessionId, SELECT_ALL_JS, ft ? ft.contextId : undefined).catch(() => {});
+        await typeText(cdp, sessionId, text);
+      });
+      out({
+        typedAt: { x: Math.round(p.x), y: Math.round(p.y) },
+        text,
+        replace: !args.append,
+        trusted: true,
+        input: "real",
+        effect,
+      });
     });
   },
 
   async fill([sel, value]) {
     if (!sel || value === undefined) fail("usage: palmifer fill <selector|@eN> <value> [--fast]");
-    if (args.frame) fail("--frame is supported by snapshot/text/eval/wait; fill acts on the top document");
     return withTab(async (cdp, sessionId, target) => {
       await paceAction();
+      const ft = await frameTarget(cdp, sessionId);
       if (sel.startsWith("@e") && state.refsTab && state.refsTab !== target.targetId) {
         fail("@e refs were captured on another tab — run snapshot on this tab");
       }
-      if (args.trusted || isHuman()) {
+      if (!args.synthetic || args.trusted) {
         // Focus the field with a real click, select what is there (the way a
-        // person replaces a value), then type character by character.
-        await trustedClick(cdp, sessionId, sel);
-        await sleep(rand(90, 240));
-        await evaluate(
-          cdp,
-          sessionId,
-          `(()=>{const el=document.activeElement;if(!el)return false;
-            if(el.select){el.select();return true}
-            if(el.isContentEditable){const r=document.createRange();r.selectNodeContents(el);
-              const s=getSelection();s.removeAllRanges();s.addRange(r);return true}
-            return false})()`,
-        ).catch(() => {});
-        await sleep(rand(40, 120));
-        await typeText(cdp, sessionId, String(value));
-        out({ filled: sel, mode: "human-typed", human: isHuman() });
+        // person replaces a value), then type it in. Under --fast that is one
+        // trusted Input.insertText instead of a character-by-character walk.
+        const { effect } = await withEffect(cdp, sessionId, ft, async () => {
+          await trustedClick(cdp, sessionId, sel, ft);
+          if (isHuman()) await sleep(rand(90, 240));
+          await evaluate(cdp, sessionId, SELECT_ALL_JS, ft ? ft.contextId : undefined).catch(() => {});
+          if (isHuman()) await sleep(rand(40, 120));
+          await typeText(cdp, sessionId, String(value));
+        });
+        out({
+          filled: sel,
+          mode: isHuman() ? "typed" : "inserted",
+          trusted: true,
+          input: "real",
+          human: isHuman(),
+          effect,
+        });
         return;
       }
       const fn = `function(v){
@@ -1506,28 +1928,40 @@ const commands = {
       } else {
         const { result } = await cdp.send(
           "Runtime.evaluate",
-          { expression: `document.querySelector(${JSON.stringify(sel)})` },
+          { expression: `document.querySelector(${JSON.stringify(sel)})`, ...(ft ? { contextId: ft.contextId } : {}) },
           sessionId,
         );
         // Runtime.evaluate answers with {result}; a missing element has no objectId.
         if (!result || !result.objectId) fail(`selector not found: ${sel}`);
         objectId = result.objectId;
       }
-      const res = await cdp.send(
-        "Runtime.callFunctionOn",
-        { objectId, functionDeclaration: fn, arguments: [{ value }], returnByValue: true },
-        sessionId,
-      );
-      out({ filled: sel, mode: res.result?.value });
+      const { value: mode, effect } = await withEffect(cdp, sessionId, ft, async () => {
+        const res = await cdp.send(
+          "Runtime.callFunctionOn",
+          { objectId, functionDeclaration: fn, arguments: [{ value }], returnByValue: true },
+          sessionId,
+        );
+        return res.result?.value;
+      });
+      out({ filled: sel, mode, trusted: false, input: "synthetic", effect });
     });
   },
 
   async upload([sel, ...files]) {
     if (!sel || !files.length) fail("usage: palmifer upload <selector|@eN> <file...>");
-    if (args.frame) fail("--frame is supported by snapshot/text/eval/wait; upload acts on the top document");
     return withTab(async (cdp, sessionId) => {
       await paceAction();
-      if (sel.startsWith("@e")) {
+      const ft = await frameTarget(cdp, sessionId);
+      if (ft) {
+        // A node inside a frame is only reachable through its own document.
+        const { result } = await cdp.send(
+          "Runtime.evaluate",
+          { expression: `document.querySelector(${JSON.stringify(sel)})`, contextId: ft.contextId },
+          sessionId,
+        );
+        if (!result || !result.objectId) fail(`selector not found in frame: ${sel}`);
+        await cdp.send("DOM.setFileInputFiles", { files, objectId: result.objectId }, sessionId);
+      } else if (sel.startsWith("@e")) {
         const backendNodeId = state.refs[sel];
         if (!backendNodeId) fail(`unknown ref ${sel} — run snapshot first`);
         await cdp.send("DOM.setFileInputFiles", { files, backendNodeId }, sessionId);
@@ -1543,18 +1977,48 @@ const commands = {
 
   async screenshot([path]) {
     return withTab(async (cdp, sessionId, target) => {
-      const params = { format: "jpeg", quality: 80 };
-      if (args.full) {
-        const m = await cdp.send("Page.getLayoutMetrics", {}, sessionId);
-        const s = m.cssContentSize || m.contentSize;
+      const outPath = resolveOutputPath(path, Object.keys(IMAGE_FORMATS), ".png");
+      const format = IMAGE_FORMATS[extname(outPath).toLowerCase()] || "png";
+      const params = format === "jpeg" ? { format, quality: Number(args.quality || 80) } : { format };
+      const metrics = await cdp.send("Page.getLayoutMetrics", {}, sessionId);
+      const view = metrics.cssLayoutViewport || metrics.layoutViewport || {};
+      const content = metrics.cssContentSize || metrics.contentSize || {};
+      const [scrollX, scrollY] = (await evaluate(cdp, sessionId, "[Math.round(scrollX), Math.round(scrollY)]")) || [0, 0];
+      const width = args.full ? content.width : view.clientWidth;
+      const height = args.full ? content.height : view.clientHeight;
+      let scale = args.scale ? Number(args.scale) : 1;
+      // A 2500x2500 screenshot is expensive to look at; --max-width gets the
+      // layout without the pixels.
+      if (args["max-width"] && width) scale = Math.min(scale, Number(args["max-width"]) / width);
+      if (!Number.isFinite(scale) || scale <= 0) fail("--scale / --max-width must be positive numbers");
+      scale = Math.min(scale, 3);
+      if (args.full || scale !== 1) {
         params.captureBeyondViewport = true;
-        params.clip = { x: 0, y: 0, width: s.width, height: s.height, scale: 1 };
+        params.clip = {
+          x: args.full ? 0 : scrollX,
+          y: args.full ? 0 : scrollY,
+          width,
+          height,
+          scale,
+        };
       }
-      const { data } = await cdp.send("Page.captureScreenshot", params, sessionId);
-      const outPath = path || join(process.env.TMPDIR || "/tmp", `palmifer-${Date.now()}.jpg`);
-      mkdirSync(dirname(outPath), { recursive: true });
-      writeFileSync(outPath, Buffer.from(data, "base64"));
-      out({ path: outPath, full: !!args.full, title: target.title });
+      let annotation = null;
+      if (args.annotate) annotation = await annotateRefs(cdp, sessionId);
+      try {
+        const { data } = await cdp.send("Page.captureScreenshot", params, sessionId);
+        mkdirSync(dirname(outPath), { recursive: true });
+        writeFileSync(outPath, Buffer.from(data, "base64"));
+        out({
+          path: outPath,
+          format,
+          full: !!args.full,
+          ...(scale !== 1 ? { scale: Number(scale.toFixed(3)) } : {}),
+          ...(args.annotate ? { annotated: annotation.count } : {}),
+          title: target.title,
+        });
+      } finally {
+        if (annotation) await annotation.remove().catch(() => {});
+      }
     });
   },
 
@@ -1565,7 +2029,7 @@ const commands = {
         { printBackground: true, paperWidth: 8.27, paperHeight: 11.69 },
         sessionId,
       );
-      const outPath = path || join(process.env.TMPDIR || "/tmp", `palmifer-${Date.now()}.pdf`);
+      const outPath = resolveOutputPath(path, [".pdf"], ".pdf");
       mkdirSync(dirname(outPath), { recursive: true });
       writeFileSync(outPath, Buffer.from(data, "base64"));
       out({ path: outPath, title: target.title });
@@ -1622,8 +2086,8 @@ const commands = {
     if (sub === "list") {
       const filter = args.filter ? String(args.filter) : null;
       const list = [...net.requests.values()]
-        .filter((r) => !filter || r.url.includes(filter))
-        .map((r) => ({
+        .map((r, i) => ({
+          i,
           requestId: r.requestId,
           method: r.method,
           status: r.status,
@@ -1631,15 +2095,22 @@ const commands = {
           type: r.type,
           completed: r.completed,
           url: r.url.slice(0, 140),
-        }));
+        }))
+        .filter((r) => !filter || r.url.includes(filter));
       out({ count: list.length, requests: list.slice(0, Number(args.limit || 100)) });
       return;
     }
     if (sub === "detail") {
-      const id = requestId;
-      if (!id) fail("usage: palmifer network detail <requestId>");
+      let id = requestId;
+      if (!id) fail("usage: palmifer network detail <requestId|i>");
+      // A row number from `network list` is easier to reach for than a CDP id
+      // like "25211.7"; both work.
+      if (!net.requests.has(id) && /^\d+$/.test(String(id))) {
+        const byIndex = [...net.requests.values()][Number(id)];
+        if (byIndex) id = byIndex.requestId;
+      }
       const r = net.requests.get(id);
-      if (!r) fail(`no captured request ${id}`);
+      if (!r) fail(`no captured request ${requestId} — \`palmifer network list\` shows the ids`);
       let body = null;
       let bodyError = null;
       try {
@@ -1669,25 +2140,27 @@ const commands = {
       await paceAction();
       await ensureVisible(cdp, sessionId);
       const spec = keySpec(key);
-      await cdp.send(
-        "Input.dispatchKeyEvent",
-        { type: spec.text === undefined ? "rawKeyDown" : "keyDown", ...spec },
-        sessionId,
-      );
-      if (isHuman()) await sleep(rand(25, 90));
-      await cdp.send(
-        "Input.dispatchKeyEvent",
-        {
-          type: "keyUp",
-          key: spec.key,
-          code: spec.code,
-          windowsVirtualKeyCode: spec.windowsVirtualKeyCode,
-          nativeVirtualKeyCode: spec.vk,
-          modifiers: spec.modifiers,
-        },
-        sessionId,
-      );
-      out({ pressed: key, human: isHuman() });
+      const { effect } = await withEffect(cdp, sessionId, null, async () => {
+        await cdp.send(
+          "Input.dispatchKeyEvent",
+          { type: spec.text === undefined ? "rawKeyDown" : "keyDown", ...spec },
+          sessionId,
+        );
+        if (isHuman()) await sleep(rand(25, 90));
+        await cdp.send(
+          "Input.dispatchKeyEvent",
+          {
+            type: "keyUp",
+            key: spec.key,
+            code: spec.code,
+            windowsVirtualKeyCode: spec.windowsVirtualKeyCode,
+            nativeVirtualKeyCode: spec.vk,
+            modifiers: spec.modifiers,
+          },
+          sessionId,
+        );
+      });
+      out({ pressed: key, input: "real", human: isHuman(), effect });
     });
   },
 
@@ -1768,8 +2241,8 @@ const commands = {
 
     if (sub === "status" || args.status) {
       const p = privateBrowser();
-      if (!p && activeMode() === "private") setMode("real"); // it died; do not report a mode we cannot honour
-      // Never poke the user's browser just to answer a status question.
+      // Never poke the user's browser just to answer a status question, and never
+      // quietly change where the next command will land either.
       const tabs = p ? await getConn().then((c) => pageTargets(c)).then((t) => t.length).catch(() => null) : null;
       out({
         mode: activeMode(),
@@ -1947,6 +2420,7 @@ const commands = {
 
     mkdirSync(profileDir, { recursive: true });
     mkdirSync(STATE_DIR, { recursive: true });
+    rotateLog(join(STATE_DIR, "private.log"));
     const log = openSync(join(STATE_DIR, "private.log"), "a");
     const child = spawn(bin, flags, { detached: true, stdio: ["ignore", log, log] });
     child.unref();
@@ -2082,10 +2556,12 @@ function throwIfStopped() {
   if (commandDeadline && Date.now() > commandDeadline) fail(budgetError("(polling)").message);
 }
 
-async function runLocal(name, positional, localArgs, requestedBudget = 0) {
+async function runLocal(name, positional, localArgs, requestedBudget = 0, cwd = "") {
   // Rebind per request: a flag from the previous call must never leak forward.
   for (const k of Object.keys(args)) delete args[k];
   Object.assign(args, localArgs || {});
+  clientCwd = cwd;
+  lastCommandAt = Date.now();
   const fn = commands[name];
   if (!fn) throw new Error(`unknown command: ${name}`);
   runningCommand = name;
@@ -2102,8 +2578,30 @@ async function runLocal(name, positional, localArgs, requestedBudget = 0) {
 
 if (cmd === "__serve") {
   inDaemon = true;
+  rotateLog(LOG_FILE);
   const token = ensureToken();
   let queue = Promise.resolve();
+
+  // Reclaim a forgotten throwaway browser. The check is periodic and cheap; it
+  // never fires while a command is in flight, and it never touches a
+  // `--profile-dir` instance, whose profile exists for a reason.
+  const idleAfter = idleReclaimMs();
+  const idleCheckMs = Math.max(500, Number(process.env.PALMIFER_PRIVATE_IDLE_CHECK_MS || 60_000));
+  if (idleAfter) {
+    setInterval(async () => {
+      try {
+        const p = readJson(PRIVATE_FILE);
+        if (!p || p.persistent || runningCommand) return;
+        const last = Math.max(lastCommandAt, Number(p.startedAt) || 0);
+        if (Date.now() - last < idleAfter) return;
+        const minutes = Math.round((Date.now() - last) / 60000);
+        const stopped = (await stopPrivateProcess()) && activeMode() === "private";
+        console.log(`· closed the throwaway browser after ${minutes} min without a command`);
+        if (stopped) console.log("  the next command needs `palmifer browser <url>` to start a fresh one");
+      } catch {}
+    }, idleCheckMs).unref?.();
+  }
+
   const server = http.createServer(async (req, res) => {
     const host = String(req.headers.host || "").split(":")[0];
     if (host && !["127.0.0.1", "localhost", "::1", "[::1]"].includes(host)) {
@@ -2144,7 +2642,7 @@ if (cmd === "__serve") {
       console.error = (...a) => buf.push(a.map((x) => (typeof x === "string" ? x : JSON.stringify(x))).join(" "));
       let error = null;
       try {
-        await runLocal(body.cmd, body.positional || [], body.args || {}, Number(body.budget || 0));
+        await runLocal(body.cmd, body.positional || [], body.args || {}, Number(body.budget || 0), String(body.cwd || ""));
       } catch (e) {
         error = String(e.message || e);
       } finally {
@@ -2246,6 +2744,7 @@ if (cmd === "__serve") {
         cmd,
         positional: rest,
         args,
+        cwd: process.cwd(),
         budget: Number(process.env.PALMIFER_CMD_BUDGET_MS || 0) || undefined,
       }),
       signal: AbortSignal.timeout(180000),

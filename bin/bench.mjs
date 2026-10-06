@@ -36,7 +36,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 const SHIM = join(HERE, "palmifer");
 const CLI = join(HERE, "palmifer.mjs");
 const PORT = Number(process.env.PALMIFER_DAEMON_PORT || 8798);
-const TOKEN_FILE = join(homedir(), ".cache", "palmifer", "token");
+// The token lives beside the daemon's state, which PALMIFER_STATE_DIR can move —
+// a benchmark run from an agent's own state directory must not measure 401s.
+const STATE_DIR = process.env.PALMIFER_STATE_DIR || join(homedir(), ".cache", "palmifer");
+const TOKEN_FILE = join(STATE_DIR, "token");
 
 const argv = process.argv.slice(2);
 const flag = (name) => argv.includes(name);
@@ -150,10 +153,27 @@ try {
   process.exit(statusRun.status || 1);
 }
 
-const daemonPid = spawnSync("pgrep", ["-f", "palmifer.mjs __serve"], { encoding: "utf8" }).stdout.trim().split("\n")[0];
-const daemonRss = daemonPid
-  ? Number(spawnSync("ps", ["-p", daemonPid, "-o", "rss="], { encoding: "utf8" }).stdout.trim()) / 1024
-  : null;
+// `ps` and `pgrep` are missing or blocked in plenty of sandboxes — which is
+// exactly where an agent runs this. RSS is decoration: never let it fail the run.
+function tryExec(cmd, argv) {
+  try {
+    const r = spawnSync(cmd, argv, { encoding: "utf8" });
+    return typeof r.stdout === "string" ? r.stdout.trim() : "";
+  } catch {
+    return "";
+  }
+}
+/** The daemon serving this state directory, so RSS is not another daemon's. */
+function ownDaemonPid() {
+  try {
+    return readFileSync(join(STATE_DIR, "daemon.pid"), "utf8").trim().split("\n")[0] || "";
+  } catch {
+    return "";
+  }
+}
+const daemonPid = ownDaemonPid() || tryExec("pgrep", ["-f", "palmifer.mjs __serve"]).split("\n")[0] || "";
+const rssText = daemonPid ? tryExec("ps", ["-p", daemonPid, "-o", "rss="]) : "";
+const daemonRss = rssText ? Number(rssText) / 1024 : null;
 
 // ---------------------------------------------------------------- matrix
 
